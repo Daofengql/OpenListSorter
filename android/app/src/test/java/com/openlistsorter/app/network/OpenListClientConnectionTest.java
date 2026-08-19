@@ -128,8 +128,8 @@ public final class OpenListClientConnectionTest {
         byte[] response = "{\"code\":200,\"message\":\"success\",\"data\":{\"content\":[]}}"
                 .getBytes(StandardCharsets.UTF_8);
         OutputStream output = socket.getOutputStream();
-        output.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-                + response.length + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+        output.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1));
         output.write(response);
         output.flush();
     }

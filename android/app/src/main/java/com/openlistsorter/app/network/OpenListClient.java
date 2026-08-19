@@ -13,9 +13,7 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.ConnectException;
-import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.MalformedURLException;
 import java.net.SocketTimeoutException;
@@ -29,6 +27,14 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 
 import javax.net.ssl.SSLException;
 
@@ -81,6 +87,14 @@ public final class OpenListClient {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newCachedThreadPool();
+    private final OkHttpClient httpClient = new OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build();
     private volatile boolean closed;
     private volatile String baseUrl = "";
     private volatile String token = "";
@@ -150,7 +164,7 @@ public final class OpenListClient {
                 callback.onResult(false, "服务器地址测试失败: " + serverMessage);
                 return;
             }
-            if (stage != null) stage.onStage("服务器已响应，正在验证 token...");
+            if (stage != null) stage.onStage("服务器已响应，正在读取根目录验证 token...");
             listDirectory("/", false, (ok, message, path, entries) ->
                     callback.onResult(ok, ok ? "token 可用" : "token 验证失败: " + message));
         });
@@ -381,6 +395,8 @@ public final class OpenListClient {
         closed = true;
         mainHandler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
+        httpClient.dispatcher().cancelAll();
+        httpClient.connectionPool().evictAll();
     }
 
     private void moveOrCopy(String endpoint, String sourceDirectory, String fileName,
@@ -455,50 +471,43 @@ public final class OpenListClient {
                                        java.util.Map<String, String> extraHeaders,
                                        ProgressCallback progressCallback) {
         HttpResult result = new HttpResult();
-        HttpURLConnection connection = null;
         try {
-            connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod(method);
-            connection.setConnectTimeout(10000);
-            connection.setReadTimeout(progressCallback == null ? 15000 : 60000);
-            connection.setInstanceFollowRedirects(true);
-            connection.setRequestProperty("User-Agent", "OpenListSorter/1.0 Android");
-            if (body != null) {
-                connection.setDoOutput(true);
-                connection.setFixedLengthStreamingMode(body.length);
-                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-                connection.setRequestProperty("Accept", "application/json");
-            }
+            Request.Builder requestBuilder = new Request.Builder()
+                    .url(url)
+                    .header("Accept-Encoding", "identity")
+                    .header("User-Agent", "OpenListSorter/1.0 Android")
+                    .header("Connection", "close");
             if (!token.isEmpty() && sameOrigin(url, new URL(baseUrl))) {
-                connection.setRequestProperty("Authorization", token);
+                requestBuilder.header("Authorization", token);
             }
+            MediaType mediaType = MediaType.parse("application/json; charset=utf-8");
             if (extraHeaders != null) {
                 for (java.util.Map.Entry<String, String> header : extraHeaders.entrySet()) {
-                    connection.setRequestProperty(header.getKey(), header.getValue());
+                    requestBuilder.header(header.getKey(), header.getValue());
                 }
                 if (extraHeaders.containsKey("File-Path")) {
-                    connection.setRequestProperty("Content-Type", "application/octet-stream");
-                    connection.setRequestProperty("Accept", "application/json");
+                    mediaType = MediaType.parse("application/octet-stream");
+                    requestBuilder.header("Accept", "application/json");
                 }
             }
-            if (body != null) {
-                try (OutputStream output = connection.getOutputStream()) {
-                    output.write(body);
+            RequestBody requestBody = body == null ? null : RequestBody.create(body, mediaType);
+            if (body == null && "GET".equalsIgnoreCase(method)) {
+                requestBuilder.get();
+            } else {
+                requestBuilder.method(method, requestBody);
+            }
+            try (Response response = httpClient.newCall(requestBuilder.build()).execute()) {
+                result.status = response.code();
+                ResponseBody responseBody = response.body();
+                if (responseBody != null) {
+                    result.body = readAll(responseBody.byteStream(), responseBody.contentLength(),
+                            progressCallback);
                 }
+                Log.d(TAG, method + " " + url + " -> HTTP " + result.status);
             }
-            result.status = connection.getResponseCode();
-            InputStream input = result.status >= 400 ? connection.getErrorStream() : connection.getInputStream();
-            if (input != null) {
-                result.body = readAll(input, connection.getContentLengthLong(), progressCallback);
-            }
-            Log.d(TAG, method + " " + url + " -> HTTP " + result.status);
         } catch (Exception error) {
             result.error = friendlyError(error, url);
             Log.w(TAG, method + " " + url + " failed: " + result.error, error);
-        } finally {
-            if (connection != null) {
-                connection.disconnect();
-            }
         }
         return result;
     }
@@ -533,8 +542,15 @@ public final class OpenListClient {
         try (InputStream stream = input; ByteArrayOutputStream output = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[16384];
             long received = 0;
-            int count;
-            while ((count = stream.read(buffer)) >= 0) {
+            while (total < 0 || received < total) {
+                int requested = buffer.length;
+                if (total >= 0) {
+                    requested = (int) Math.min(requested, total - received);
+                }
+                int count = stream.read(buffer, 0, requested);
+                if (count < 0) {
+                    break;
+                }
                 if (count == 0) {
                     continue;
                 }
