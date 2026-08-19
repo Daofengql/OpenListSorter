@@ -1460,7 +1460,7 @@ public final class MainActivity extends AppCompatActivity {
         value.setBoxBackgroundMode(TextInputLayout.BOX_BACKGROUND_OUTLINE);
         value.setBoxCornerRadii(dp(8), dp(8), dp(8), dp(8));
         if (child.getId() == View.NO_ID) child.setId(View.generateViewId());
-        value.addView(child, new ViewGroup.LayoutParams(-1, -2));
+        value.addView(child, new LinearLayout.LayoutParams(-1, -2));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         params.setMargins(0, dp(4), 0, dp(4));
         value.setLayoutParams(params);
