@@ -2,6 +2,7 @@ package com.openlistsorter.app.network;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 
 import com.openlistsorter.app.data.Models;
 
@@ -13,19 +14,32 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.ConnectException;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
+import java.net.MalformedURLException;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URL;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+
+import javax.net.ssl.SSLException;
 
 public final class OpenListClient {
+    private static final String TAG = "OpenListClient";
     public interface SimpleCallback {
         void onResult(boolean ok, String message);
+    }
+
+    public interface StageCallback {
+        void onStage(String message);
     }
 
     public interface ListCallback {
@@ -93,7 +107,13 @@ public final class OpenListClient {
     }
 
     public void login(String endpoint, String username, String password, SimpleCallback callback) {
+        login(endpoint, username, password, null, callback);
+    }
+
+    public void login(String endpoint, String username, String password, StageCallback stage,
+                      SimpleCallback callback) {
         setBaseUrl(endpoint);
+        if (stage != null) stage.onStage("正在准备账号登录...");
         token = "";
         JSONObject payload = new JSONObject();
         try {
@@ -117,10 +137,38 @@ public final class OpenListClient {
     }
 
     public void validateToken(String endpoint, String tokenValue, SimpleCallback callback) {
+        validateToken(endpoint, tokenValue, null, callback);
+    }
+
+    public void validateToken(String endpoint, String tokenValue, StageCallback stage,
+                              SimpleCallback callback) {
         setBaseUrl(endpoint);
         setToken(tokenValue);
-        listDirectory("/", false, (ok, message, path, entries) ->
-                callback.onResult(ok, ok ? "token 可用" : message));
+        if (stage != null) stage.onStage("正在测试服务器地址...");
+        probeEndpoint((serverOk, serverMessage) -> {
+            if (!serverOk) {
+                callback.onResult(false, "服务器地址测试失败: " + serverMessage);
+                return;
+            }
+            if (stage != null) stage.onStage("服务器已响应，正在验证 token...");
+            listDirectory("/", false, (ok, message, path, entries) ->
+                    callback.onResult(ok, ok ? "token 可用" : "token 验证失败: " + message));
+        });
+    }
+
+    private void probeEndpoint(SimpleCallback callback) {
+        try {
+            executor.execute(() -> {
+                HttpResult result = request("GET", "/api/public/settings", null, null);
+                if (!result.error.isEmpty()) {
+                    post(callback, false, result.error);
+                } else {
+                    post(callback, true, "服务器已响应 HTTP " + result.status);
+                }
+            });
+        } catch (RejectedExecutionException error) {
+            post(callback, false, "请求线程池已关闭，请重试");
+        }
     }
 
     public void fetchConnectionDiagnostics(java.util.function.Consumer<ConnectionDiagnostics> callback) {
@@ -131,43 +179,58 @@ public final class OpenListClient {
             post(callback, diagnostics);
             return;
         }
-        executor.execute(() -> {
-            long started = System.currentTimeMillis();
-            HttpResult result = request("GET", "/api/public/settings", null, null);
-            diagnostics.latencyMs = System.currentTimeMillis() - started;
-            if (result.error.isEmpty()) {
+        try {
+            executor.execute(() -> {
                 try {
-                    JSONObject root = new JSONObject(new String(result.body, StandardCharsets.UTF_8));
-                    diagnostics.publicSettingsOk = result.status >= 200 && result.status < 300
-                            && root.optInt("code", -1) == 200;
-                    diagnostics.message = firstNonEmpty(root.optString("message", ""), root.optString("msg", ""));
-                    JSONObject data = root.optJSONObject("data");
-                    if (data != null) {
-                        diagnostics.version = firstNonEmpty(data.optString("version", ""), data.optString("Version", ""));
-                        diagnostics.siteTitle = firstNonEmpty(data.optString("site_title", ""),
-                                firstNonEmpty(data.optString("siteTitle", ""), data.optString("title", "")));
-                        JSONObject settings = data.optJSONObject("settings");
-                        if (settings != null) {
-                            diagnostics.version = firstNonEmpty(diagnostics.version,
-                                    firstNonEmpty(settings.optString("version", ""), settings.optString("Version", "")));
-                            diagnostics.siteTitle = firstNonEmpty(diagnostics.siteTitle,
-                                    firstNonEmpty(settings.optString("site_title", ""), settings.optString("title", "")));
+                    long started = System.currentTimeMillis();
+                    HttpResult result = request("GET", "/api/public/settings", null, null);
+                    diagnostics.latencyMs = System.currentTimeMillis() - started;
+                    if (result.error.isEmpty()) {
+                        try {
+                            JSONObject root = new JSONObject(new String(result.body, StandardCharsets.UTF_8));
+                            diagnostics.publicSettingsOk = result.status >= 200 && result.status < 300
+                                    && root.optInt("code", -1) == 200;
+                            diagnostics.message = firstNonEmpty(root.optString("message", ""), root.optString("msg", ""));
+                            JSONObject data = root.optJSONObject("data");
+                            if (data != null) {
+                                diagnostics.version = firstNonEmpty(data.optString("version", ""), data.optString("Version", ""));
+                                diagnostics.siteTitle = firstNonEmpty(data.optString("site_title", ""),
+                                        firstNonEmpty(data.optString("siteTitle", ""), data.optString("title", "")));
+                                JSONObject settings = data.optJSONObject("settings");
+                                if (settings != null) {
+                                    diagnostics.version = firstNonEmpty(diagnostics.version,
+                                            firstNonEmpty(settings.optString("version", ""), settings.optString("Version", "")));
+                                    diagnostics.siteTitle = firstNonEmpty(diagnostics.siteTitle,
+                                            firstNonEmpty(settings.optString("site_title", ""), settings.optString("title", "")));
+                                }
+                            }
+                        } catch (JSONException error) {
+                            diagnostics.message = error.getMessage();
                         }
+                    } else {
+                        diagnostics.message = result.error;
                     }
-                } catch (JSONException error) {
-                    diagnostics.message = error.getMessage();
+                    try {
+                        URI uri = URI.create(baseUrl);
+                        diagnostics.ipAddress = InetAddress.getByName(uri.getHost()).getHostAddress();
+                    } catch (Exception ignored) {
+                        diagnostics.ipAddress = "未知";
+                    }
+                    post(callback, diagnostics);
+                } catch (Throwable throwable) {
+                    Log.e(TAG, "fetchConnectionDiagnostics crashed", throwable);
+                    if (diagnostics.message.isEmpty()) {
+                        diagnostics.message = "检测异常: " + throwable;
+                    }
+                    post(callback, diagnostics);
                 }
-            } else {
-                diagnostics.message = result.error;
-            }
-            try {
-                URI uri = URI.create(baseUrl);
-                diagnostics.ipAddress = InetAddress.getByName(uri.getHost()).getHostAddress();
-            } catch (Exception ignored) {
-                diagnostics.ipAddress = "未知";
+            });
+        } catch (RejectedExecutionException error) {
+            if (diagnostics.message.isEmpty()) {
+                diagnostics.message = "检测线程池已关闭，请重试";
             }
             post(callback, diagnostics);
-        });
+        }
     }
 
     public void listDirectory(String path, boolean refresh, ListCallback callback) {
@@ -226,16 +289,25 @@ public final class OpenListClient {
             post(callback, false, "文件下载地址无效。", new byte[0]);
             return;
         }
-        executor.execute(() -> {
-            HttpResult result = requestAbsolute(url, progressCallback);
-            if (!result.error.isEmpty()) {
-                post(callback, false, result.error, new byte[0]);
-            } else if (result.status < 200 || result.status >= 300) {
-                post(callback, false, "下载 HTTP 状态码 " + result.status, result.body);
-            } else {
-                post(callback, true, "success", result.body);
-            }
-        });
+        try {
+            executor.execute(() -> {
+                try {
+                    HttpResult result = requestAbsolute(url, progressCallback);
+                    if (!result.error.isEmpty()) {
+                        post(callback, false, result.error, new byte[0]);
+                    } else if (result.status < 200 || result.status >= 300) {
+                        post(callback, false, "下载 HTTP 状态码 " + result.status, result.body);
+                    } else {
+                        post(callback, true, "success", result.body);
+                    }
+                } catch (Throwable throwable) {
+                    Log.e(TAG, "downloadUrl(" + url + ") crashed", throwable);
+                    post(callback, false, "下载异常: " + throwable, new byte[0]);
+                }
+            });
+        } catch (RejectedExecutionException error) {
+            post(callback, false, "下载线程池已关闭，请重试", new byte[0]);
+        }
     }
 
     public void uploadFile(String remotePath, byte[] data, boolean overwrite, SimpleCallback callback) {
@@ -244,15 +316,24 @@ public final class OpenListClient {
         headers.put("File-Path", percentEncodePath(normalized));
         headers.put("As-Task", "false");
         headers.put("Overwrite", overwrite ? "true" : "false");
-        executor.execute(() -> {
-            HttpResult result = request("PUT", "/api/fs/put", data, headers);
-            if (!result.error.isEmpty()) {
-                post(callback, false, result.error);
-                return;
-            }
-            ApiResponse api = parseApi(result.body);
-            post(callback, result.status >= 200 && result.status < 300 && api.ok, api.message);
-        });
+        try {
+            executor.execute(() -> {
+                try {
+                    HttpResult result = request("PUT", "/api/fs/put", data, headers);
+                    if (!result.error.isEmpty()) {
+                        post(callback, false, result.error);
+                        return;
+                    }
+                    ApiResponse api = parseApi(result.body);
+                    post(callback, result.status >= 200 && result.status < 300 && api.ok, api.message);
+                } catch (Throwable throwable) {
+                    Log.e(TAG, "uploadFile(" + normalized + ") crashed", throwable);
+                    post(callback, false, "上传异常: " + throwable);
+                }
+            });
+        } catch (RejectedExecutionException error) {
+            post(callback, false, "上传线程池已关闭，请重试");
+        }
     }
 
     public void removeFile(String directory, String fileName, SimpleCallback callback) {
@@ -323,20 +404,32 @@ public final class OpenListClient {
     }
 
     private void postJson(String endpoint, JSONObject payload, JsonCallback callback) {
-        executor.execute(() -> {
-            HttpResult result = request("POST", endpoint,
-                    payload.toString().getBytes(StandardCharsets.UTF_8), null);
-            if (!result.error.isEmpty()) {
-                post(callback, false, result.error, new JSONObject());
-                return;
-            }
-            if (result.status < 200 || result.status >= 300) {
-                post(callback, false, "HTTP 状态码 " + result.status, new JSONObject());
-                return;
-            }
-            ApiResponse api = parseApi(result.body);
-            post(callback, api.ok, api.message, api.data);
-        });
+        try {
+            executor.execute(() -> {
+                try {
+                    HttpResult result = request("POST", endpoint,
+                            payload.toString().getBytes(StandardCharsets.UTF_8), null);
+                    if (!result.error.isEmpty()) {
+                        post(callback, false, result.error, new JSONObject());
+                        return;
+                    }
+                    if (result.status < 200 || result.status >= 300) {
+                        ApiResponse api = parseApi(result.body);
+                        String detail = api.message;
+                        post(callback, false, "服务器返回 HTTP " + result.status
+                                + (detail.isEmpty() ? "" : ": " + detail), new JSONObject());
+                        return;
+                    }
+                    ApiResponse api = parseApi(result.body);
+                    post(callback, api.ok, api.message, api.data);
+                } catch (Throwable throwable) {
+                    Log.e(TAG, "postJson(" + endpoint + ") crashed", throwable);
+                    post(callback, false, "请求异常: " + throwable, new JSONObject());
+                }
+            });
+        } catch (RejectedExecutionException error) {
+            post(callback, false, "请求线程池已关闭，请重试", new JSONObject());
+        }
     }
 
     private HttpResult request(String method, String endpoint, byte[] body,
@@ -366,13 +459,15 @@ public final class OpenListClient {
         try {
             connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod(method);
-            connection.setConnectTimeout(15000);
-            connection.setReadTimeout(60000);
+            connection.setConnectTimeout(10000);
+            connection.setReadTimeout(progressCallback == null ? 15000 : 60000);
             connection.setInstanceFollowRedirects(true);
             connection.setRequestProperty("User-Agent", "OpenListSorter/1.0 Android");
             if (body != null) {
                 connection.setDoOutput(true);
-                connection.setRequestProperty("Content-Type", "application/json");
+                connection.setFixedLengthStreamingMode(body.length);
+                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                connection.setRequestProperty("Accept", "application/json");
             }
             if (!token.isEmpty() && sameOrigin(url, new URL(baseUrl))) {
                 connection.setRequestProperty("Authorization", token);
@@ -383,6 +478,7 @@ public final class OpenListClient {
                 }
                 if (extraHeaders.containsKey("File-Path")) {
                     connection.setRequestProperty("Content-Type", "application/octet-stream");
+                    connection.setRequestProperty("Accept", "application/json");
                 }
             }
             if (body != null) {
@@ -395,14 +491,42 @@ public final class OpenListClient {
             if (input != null) {
                 result.body = readAll(input, connection.getContentLengthLong(), progressCallback);
             }
+            Log.d(TAG, method + " " + url + " -> HTTP " + result.status);
         } catch (Exception error) {
-            result.error = error.getMessage() == null ? error.toString() : error.getMessage();
+            result.error = friendlyError(error, url);
+            Log.w(TAG, method + " " + url + " failed: " + result.error, error);
         } finally {
             if (connection != null) {
                 connection.disconnect();
             }
         }
         return result;
+    }
+
+    private static String friendlyError(Exception error, URL url) {
+        String raw = error.getMessage() == null ? error.toString() : error.getMessage();
+        String host = url.getHost() == null ? "" : url.getHost().toLowerCase(Locale.US);
+        if (error instanceof ConnectException
+                && ("localhost".equals(host) || "127.0.0.1".equals(host)
+                || "0.0.0.0".equals(host))) {
+            return "Android 设备上的 " + host + " 指向设备本身，不是电脑上的 OpenList；请改用电脑局域网 IP。";
+        }
+        if (error instanceof UnknownHostException) {
+            return "无法解析服务器域名（DNS 失败）: " + raw;
+        }
+        if (error instanceof ConnectException) {
+            return "无法连接到服务器（连接被拒绝，请检查地址、端口和防火墙）: " + raw;
+        }
+        if (error instanceof SocketTimeoutException) {
+            return "连接或读取超时，请检查网络和服务器状态: " + raw;
+        }
+        if (error instanceof MalformedURLException) {
+            return "服务器地址格式不正确: " + raw;
+        }
+        if (error instanceof SSLException) {
+            return "TLS/证书握手失败（自签名证书需先安装到设备或改用 http://）: " + raw;
+        }
+        return raw;
     }
 
     private byte[] readAll(InputStream input, long total, ProgressCallback progressCallback) throws IOException {
@@ -481,6 +605,17 @@ public final class OpenListClient {
 
     private static String sanitizeBaseUrl(String value) {
         String result = value == null ? "" : value.trim();
+        if (result.isEmpty()) {
+            return "";
+        }
+        String lower = result.toLowerCase(Locale.US);
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
+            int schemeEnd = result.indexOf("://");
+            if (schemeEnd > 0) {
+                result = result.substring(schemeEnd + 3);
+            }
+            result = "http://" + result;
+        }
         while (result.endsWith("/")) {
             result = result.substring(0, result.length() - 1);
         }

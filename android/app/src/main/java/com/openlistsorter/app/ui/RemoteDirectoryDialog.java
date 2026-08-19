@@ -73,7 +73,7 @@ public final class RemoteDirectoryDialog {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
 
         statusView = new TextView(context);
-        statusView.setTextColor(0xff667085);
+        statusView.setTextColor(0xff505a59);
         statusView.setPadding(0, dp(8), 0, 0);
         root.addView(statusView);
 

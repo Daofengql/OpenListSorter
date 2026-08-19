@@ -166,15 +166,16 @@ public final class MainActivity extends AppCompatActivity {
 
     private void showConnectionScreen() {
         root = baseRoot();
-        root.setPadding(dp(16), dp(20), dp(16), dp(16));
+        root.setPadding(dp(16), dp(24), dp(16), dp(16));
         MaterialPanel card = panel();
-        TextView title = heading("连接到 OpenList", 24);
+        TextView title = heading("OpenList Sorter", 24);
+        title.setTextColor(getColorCompat(R.color.primary));
         card.addView(title);
-        TextView subtitle = text("使用 endpoint + token key，或使用账号密码登录。", 0xff667085);
+        TextView subtitle = text("远程文件分类工具 · 连接 OpenList/Alist 服务器", 0xff505a59);
         card.addView(subtitle);
 
         endpointEdit = input("https://openlist.example.com");
-        card.addView(labelled("Endpoint", endpointEdit));
+        card.addView(labelled("服务器地址（Endpoint）", endpointEdit));
 
         authGroup = new RadioGroup(this);
         authGroup.setOrientation(RadioGroup.HORIZONTAL);
@@ -225,8 +226,9 @@ public final class MainActivity extends AppCompatActivity {
             if (!checked) autoLoginCheck.setChecked(false);
         });
 
-        status = text(" ", 0xff667085);
+        status = text(" ", 0xff505a59);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        status.setTextSize(13);
         card.addView(status);
         connectionProgress = new CircularProgressIndicator(this);
         connectionProgress.setIndeterminate(true);
@@ -241,7 +243,13 @@ public final class MainActivity extends AppCompatActivity {
         actions.addView(connectButton);
         card.addView(actions);
         connectButton.setOnClickListener(view -> startConnection());
-        connectionExitButton.setOnClickListener(view -> finish());
+        connectionExitButton.setOnClickListener(view -> {
+            if (busy) {
+                cancelConnection();
+            } else {
+                finish();
+            }
+        });
 
         endpointEdit.setText(profile.endpoint);
         tokenEdit.setText(profile.token);
@@ -250,9 +258,19 @@ public final class MainActivity extends AppCompatActivity {
         if (profile.authMode == ConnectionProfile.AuthMode.PASSWORD) {
             passwordMode.setChecked(true);
         }
+        TextView hint = text("提示：地址需包含 http:// 或 https:// 前缀（如 http://192.168.1.5:5244）。"
+                + "如果 OpenList 在电脑上运行，请勿填写 localhost/127.0.0.1，而要填写电脑的局域网 IP。"
+                + "HTTPS 若使用自签名证书，需先将其安装到设备并信任。", 0xff707978);
+        hint.setTextSize(12);
+        card.addView(hint);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
-        scroll.addView(card, new ScrollView.LayoutParams(
+        LinearLayout wrapper = new LinearLayout(this);
+        wrapper.setGravity(Gravity.CENTER_HORIZONTAL);
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int cardWidth = Math.min(dp(420), screenWidth - dp(32));
+        wrapper.addView(card, new LinearLayout.LayoutParams(cardWidth, LinearLayout.LayoutParams.WRAP_CONTENT));
+        scroll.addView(wrapper, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
         root.addView(scroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
@@ -266,6 +284,10 @@ public final class MainActivity extends AppCompatActivity {
             showError("请输入 endpoint");
             return;
         }
+        if (isLoopbackEndpoint(requested.endpoint)) {
+            showError("Android 上的 localhost/127.0.0.1 指向手机本身。请填写运行 OpenList 电脑的局域网 IP，例如 http://192.168.1.5:5244。");
+            return;
+        }
         if (!requested.hasCredentials()) {
             showError("请输入 token key，或完整的用户名和密码");
             return;
@@ -273,26 +295,44 @@ public final class MainActivity extends AppCompatActivity {
         final int attempt = ++connectionGeneration;
         busy = true;
         connectButton.setEnabled(false);
-        connectionExitButton.setEnabled(false);
+        connectionExitButton.setText("取消");
+        connectionExitButton.setEnabled(true);
         connectionProgress.setVisibility(View.VISIBLE);
         status.setText("正在连接...");
         connectionTimeout = () -> {
             if (attempt != connectionGeneration || !busy) return;
+            ++connectionGeneration;
             busy = false;
             connectButton.setEnabled(true);
+            connectionExitButton.setText("退出");
             connectionExitButton.setEnabled(true);
             connectionProgress.setVisibility(View.GONE);
-            status.setText("连接超时，请检查 endpoint、网络和证书后重试。");
+            status.setText("连接超时，正在检测原因...");
             client.shutdown();
             client = new OpenListClient();
+            client.setBaseUrl(requested.endpoint);
+            final int diagnosticGeneration = connectionGeneration;
+            client.fetchConnectionDiagnostics(diagnostics -> {
+                if (diagnosticGeneration != connectionGeneration || busy) return;
+                String cause = diagnostics.publicSettingsOk
+                        ? "服务器可达，但认证请求未在限时内完成（可能是服务器响应慢或鉴权方式不匹配）"
+                        : (diagnostics.message == null || diagnostics.message.isEmpty()
+                                ? "无法连接到服务器（无响应）" : diagnostics.message);
+                status.setText("连接超时（20 秒）。检测结果: " + cause
+                        + "\n请检查地址、端口、网络与 HTTPS 证书后重试。");
+            });
         };
         mainHandler.postDelayed(connectionTimeout, 20000L);
+        OpenListClient.StageCallback stage = message -> {
+            if (attempt == connectionGeneration && busy) status.setText(message);
+        };
         OpenListClient.SimpleCallback callback = (ok, message) -> {
             if (attempt != connectionGeneration) return;
             if (connectionTimeout != null) mainHandler.removeCallbacks(connectionTimeout);
             connectionTimeout = null;
             busy = false;
             connectButton.setEnabled(true);
+            connectionExitButton.setText("退出");
             connectionExitButton.setEnabled(true);
             connectionProgress.setVisibility(View.GONE);
             if (!ok) {
@@ -308,10 +348,39 @@ public final class MainActivity extends AppCompatActivity {
             showMainScreen();
         };
         if (requested.authMode == ConnectionProfile.AuthMode.PASSWORD) {
-            client.login(requested.endpoint, requested.username, requested.password, callback);
+            client.login(requested.endpoint, requested.username, requested.password, stage, callback);
         } else {
-            client.validateToken(requested.endpoint, requested.token, callback);
+            client.validateToken(requested.endpoint, requested.token, stage, callback);
         }
+    }
+
+    private boolean isLoopbackEndpoint(String endpoint) {
+        try {
+            String normalized = endpoint.trim();
+            if (!normalized.contains("://")) normalized = "http://" + normalized;
+            String host = java.net.URI.create(normalized).getHost();
+            return host != null && (host.equalsIgnoreCase("localhost")
+                    || host.equals("127.0.0.1") || host.equals("0.0.0.0")
+                    || host.equals("::1"));
+        } catch (IllegalArgumentException ignored) {
+            return false;
+        }
+    }
+
+    private void cancelConnection() {
+        ++connectionGeneration;
+        if (connectionTimeout != null) {
+            mainHandler.removeCallbacks(connectionTimeout);
+            connectionTimeout = null;
+        }
+        client.shutdown();
+        client = new OpenListClient();
+        busy = false;
+        connectButton.setEnabled(true);
+        connectionExitButton.setText("退出");
+        connectionExitButton.setEnabled(true);
+        connectionProgress.setVisibility(View.GONE);
+        status.setText("已取消连接");
     }
 
     private ConnectionProfile readProfile() {
@@ -347,7 +416,7 @@ public final class MainActivity extends AppCompatActivity {
         more.setOnClickListener(view -> showMoreActions());
         logout.setOnClickListener(view -> logout());
 
-        status = text("已连接: " + client.getBaseUrl(), 0xff667085);
+        status = text("已连接: " + client.getBaseUrl(), 0xff505a59);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         content.addView(status);
         progress = new LinearProgressIndicator(this);
@@ -392,7 +461,7 @@ public final class MainActivity extends AppCompatActivity {
         task.addView(fileActions);
         content.addView(task);
 
-        statsView = text("总文件 0 | 已提交 0 | 待保存 0 | 未处理 0", 0xff172033);
+        statsView = text("总文件 0 | 已提交 0 | 待保存 0 | 未处理 0", 0xff171c1b);
         statsView.setPadding(0, dp(10), 0, dp(10));
         content.addView(statsView);
 
@@ -401,7 +470,7 @@ public final class MainActivity extends AppCompatActivity {
         LinearLayout pageRow = row();
         previousPageButton = button("上一页");
         nextPageButton = button("下一页");
-        pageInfo = text("第 0 / 0 页", 0xff667085);
+        pageInfo = text("第 0 / 0 页", 0xff505a59);
         pageInfo.setGravity(Gravity.CENTER);
         pageRow.addView(previousPageButton);
         pageRow.addView(pageInfo, new LinearLayout.LayoutParams(0, -2, 1));
@@ -427,7 +496,7 @@ public final class MainActivity extends AppCompatActivity {
         previewHeader.addView(previousFileButton);
         previewHeader.addView(nextFileButton);
         previewPanel.addView(previewHeader);
-        previewInfo = text("请选择文件", 0xff667085);
+        previewInfo = text("请选择文件", 0xff505a59);
         previewInfo.setPadding(dp(10), dp(8), dp(10), dp(8));
         previewInfo.setBackgroundResource(R.drawable.preview_background);
         previewPanel.addView(previewInfo);
@@ -915,7 +984,7 @@ public final class MainActivity extends AppCompatActivity {
         if (tagList == null) return;
         tagList.removeAllViews();
         if (tags.isEmpty()) {
-            tagList.addView(text("请先新增 tag，并为 tag 填写目标目录。", 0xff667085));
+            tagList.addView(text("请先新增 tag，并为 tag 填写目标目录。", 0xff505a59));
         }
         for (Models.TagMapping tag : tags) {
             CheckBox check = new MaterialCheckBox(this);
@@ -1410,13 +1479,13 @@ public final class MainActivity extends AppCompatActivity {
 
     private MaterialPanel panel() {
         MaterialPanel value = new MaterialPanel(this);
-        value.setCardBackgroundColor(Color.WHITE);
-        value.setCardElevation(dp(1));
-        value.setRadius(dp(8));
+        value.setCardBackgroundColor(getColorCompat(R.color.surface));
+        value.setCardElevation(0);
+        value.setRadius(dp(10));
         value.setStrokeWidth(dp(1));
-        value.setStrokeColor(0xffdfe3eb);
+        value.setStrokeColor(getColorCompat(R.color.outline_variant));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.setMargins(0, dp(8), 0, dp(8));
+        params.setMargins(0, dp(10), 0, dp(10));
         value.setLayoutParams(params);
         return value;
     }
@@ -1429,10 +1498,11 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private TextView heading(String value, int size) {
-        TextView result = text(value, 0xff172033);
+        TextView result = text(value, getColorCompat(R.color.on_surface));
         result.setTextSize(size);
         result.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        result.setPadding(0, dp(4), 0, dp(8));
+        result.setLetterSpacing(0f);
+        result.setPadding(0, dp(6), 0, dp(10));
         return result;
     }
 
@@ -1471,6 +1541,8 @@ public final class MainActivity extends AppCompatActivity {
         MaterialButton result = new MaterialButton(this, null,
                 com.google.android.material.R.attr.materialButtonOutlinedStyle);
         result.setText(label);
+        result.setTextColor(getColorCompat(R.color.primary));
+        result.setStrokeColor(ColorStateList.valueOf(getColorCompat(R.color.outline_variant)));
         result.setAllCaps(false);
         result.setTextSize(14);
         result.setMinHeight(dp(44));
@@ -1483,6 +1555,8 @@ public final class MainActivity extends AppCompatActivity {
     private Button primaryButton(String label) {
         MaterialButton result = new MaterialButton(this);
         result.setText(label);
+        result.setTextColor(getColorCompat(R.color.on_primary));
+        result.setBackgroundTintList(ColorStateList.valueOf(getColorCompat(R.color.primary)));
         result.setAllCaps(false);
         result.setTextSize(14);
         result.setMinHeight(dp(44));
@@ -1528,5 +1602,9 @@ public final class MainActivity extends AppCompatActivity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private int getColorCompat(int resId) {
+        return getColor(resId);
     }
 }

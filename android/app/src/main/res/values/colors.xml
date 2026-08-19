@@ -1,4 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="blue_primary">#365CF5</color>
-    <color name="page_background">#F3F5F9</color>
+    <!-- DraARL 风格调色板 -->
+    <color name="primary">#176B75</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="primary_container">#D3EFF2</color>
+    <color name="on_primary_container">#0A4148</color>
+    <color name="secondary">#4E5F61</color>
+    <color name="on_secondary">#FFFFFF</color>
+    <color name="secondary_container">#E1EBEB</color>
+    <color name="on_secondary_container">#344748</color>
+    <color name="page_background">#F4F6F5</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="on_surface">#171C1B</color>
+    <color name="on_surface_variant">#505A59</color>
+    <color name="surface_variant">#E8ECEB</color>
+    <color name="outline">#707978</color>
+    <color name="outline_variant">#CDD5D3</color>
+    <color name="error">#B3261E</color>
+    <color name="error_container">#FCE8E6</color>
 </resources>
