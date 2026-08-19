@@ -27,6 +27,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.card.MaterialCardView;
@@ -167,6 +170,7 @@ public final class MainActivity extends AppCompatActivity {
     private void showConnectionScreen() {
         root = baseRoot();
         root.setPadding(dp(16), dp(24), dp(16), dp(16));
+        applySystemBarInsets(root);
         MaterialPanel card = panel();
         TextView title = heading("OpenList Sorter", 24);
         title.setTextColor(getColorCompat(R.color.primary));
@@ -555,6 +559,8 @@ public final class MainActivity extends AppCompatActivity {
         loadLocalSettings();
         refreshTags();
         updateStats();
+        applySystemBarInsets(root);
+        setContentView(root);
     }
 
     private void loadLocalSettings() {
@@ -1475,6 +1481,20 @@ public final class MainActivity extends AppCompatActivity {
         value.setOrientation(LinearLayout.VERTICAL);
         value.setBackgroundResource(R.color.page_background);
         return value;
+    }
+
+    private void applySystemBarInsets(View view) {
+        final int left = view.getPaddingLeft();
+        final int top = view.getPaddingTop();
+        final int right = view.getPaddingRight();
+        final int bottom = view.getPaddingBottom();
+        ViewCompat.setOnApplyWindowInsetsListener(view, (target, windowInsets) -> {
+            Insets bars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());
+            target.setPadding(left + bars.left, top + bars.top,
+                    right + bars.right, bottom + bars.bottom);
+            return windowInsets;
+        });
+        ViewCompat.requestApplyInsets(view);
     }
 
     private MaterialPanel panel() {

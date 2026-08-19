@@ -474,13 +474,11 @@ public final class OpenListClient {
         try {
             Request.Builder requestBuilder = new Request.Builder()
                     .url(url)
-                    .header("Accept-Encoding", "identity")
-                    .header("User-Agent", "OpenListSorter/1.0 Android")
-                    .header("Connection", "close");
+                    .header("User-Agent", "OpenListSorter/1.0");
             if (!token.isEmpty() && sameOrigin(url, new URL(baseUrl))) {
                 requestBuilder.header("Authorization", token);
             }
-            MediaType mediaType = MediaType.parse("application/json; charset=utf-8");
+            MediaType mediaType = MediaType.parse("application/json");
             if (extraHeaders != null) {
                 for (java.util.Map.Entry<String, String> header : extraHeaders.entrySet()) {
                     requestBuilder.header(header.getKey(), header.getValue());
@@ -500,8 +498,10 @@ public final class OpenListClient {
                 result.status = response.code();
                 ResponseBody responseBody = response.body();
                 if (responseBody != null) {
-                    result.body = readAll(responseBody.byteStream(), responseBody.contentLength(),
-                            progressCallback);
+                    result.body = progressCallback == null
+                            ? responseBody.bytes()
+                            : readAll(responseBody.byteStream(), responseBody.contentLength(),
+                                    progressCallback);
                 }
                 Log.d(TAG, method + " " + url + " -> HTTP " + result.status);
             }
