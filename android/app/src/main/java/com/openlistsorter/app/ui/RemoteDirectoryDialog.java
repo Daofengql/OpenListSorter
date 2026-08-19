@@ -29,6 +29,12 @@ public final class RemoteDirectoryDialog {
     private final ListView listView;
     private final ArrayAdapter<String> adapter;
     private final ArrayList<Models.RemoteEntry> directories = new ArrayList<>();
+    private final Button rootButton;
+    private final Button upButton;
+    private final Button refreshButton;
+    private int requestGeneration;
+    private int lastClickPosition = -1;
+    private long lastClickTime;
     private String currentPath;
 
     public RemoteDirectoryDialog(Context context, OpenListClient client, String startPath,
@@ -44,12 +50,12 @@ public final class RemoteDirectoryDialog {
 
         LinearLayout actions = new LinearLayout(context);
         actions.setOrientation(LinearLayout.HORIZONTAL);
-        Button rootButton = button("根目录");
-        Button upButton = button("上一级");
-        Button refreshButton = button("刷新");
-        actions.addView(rootButton);
-        actions.addView(upButton);
-        actions.addView(refreshButton);
+        rootButton = button("根目录");
+        upButton = button("上一级");
+        refreshButton = button("刷新");
+        actions.addView(rootButton, new LinearLayout.LayoutParams(0, -2, 1));
+        actions.addView(upButton, new LinearLayout.LayoutParams(0, -2, 1));
+        actions.addView(refreshButton, new LinearLayout.LayoutParams(0, -2, 1));
         root.addView(actions);
 
         pathView = new TextView(context);
@@ -79,14 +85,24 @@ public final class RemoteDirectoryDialog {
                     callback.onSelected(currentPath);
                     dialog.dismiss();
                 }));
+        dialog.setOnDismissListener(ignored -> ++requestGeneration);
 
         rootButton.setOnClickListener(view -> load("/", false));
         upButton.setOnClickListener(view -> load(Models.parentRemotePath(currentPath), false));
         refreshButton.setOnClickListener(view -> load(currentPath, true));
         listView.setOnItemClickListener((parent, view, position, id) -> {
-            if (position >= 0 && position < directories.size()) {
-                load(directories.get(position).path, false);
+            if (position < 0 || position >= directories.size()) {
+                return;
             }
+            long now = android.os.SystemClock.uptimeMillis();
+            if (position == lastClickPosition && now - lastClickTime < 450L) {
+                lastClickPosition = -1;
+                load(directories.get(position).path, false);
+                return;
+            }
+            lastClickPosition = position;
+            lastClickTime = now;
+            statusView.setText("已选中: " + directories.get(position).name + "，再次点击进入");
         });
     }
 
@@ -97,19 +113,23 @@ public final class RemoteDirectoryDialog {
 
     private void load(String path, boolean refresh) {
         currentPath = Models.normalizeRemotePath(path);
+        final int generation = ++requestGeneration;
         pathView.setText(currentPath);
         statusView.setText("正在加载目录...");
         adapter.clear();
         adapter.add("正在加载目录...");
+        setBusy(true);
         client.listDirectory(currentPath, refresh, (ok, message, loadedPath, entries) -> {
-            if (!loadedPath.equals(currentPath)) {
+            if (generation != requestGeneration || !dialog.isShowing()
+                    || !loadedPath.equals(currentPath)) {
                 return;
             }
+            setBusy(false);
             adapter.clear();
             directories.clear();
             if (!ok) {
                 adapter.add("目录加载失败");
-                statusView.setText(message);
+                statusView.setText("目录加载失败: " + message);
                 return;
             }
             for (Models.RemoteEntry entry : entries) {
@@ -123,6 +143,16 @@ public final class RemoteDirectoryDialog {
             }
             statusView.setText("子目录: " + directories.size());
         });
+    }
+
+    private void setBusy(boolean busy) {
+        rootButton.setEnabled(!busy);
+        upButton.setEnabled(!busy);
+        refreshButton.setEnabled(!busy);
+        listView.setEnabled(!busy);
+        if (dialog.isShowing()) {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(!busy);
+        }
     }
 
     private Button button(String text) {

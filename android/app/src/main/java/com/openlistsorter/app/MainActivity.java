@@ -2,32 +2,26 @@ package com.openlistsorter.app;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
-import android.view.ViewGroup;
-import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
-import android.widget.HorizontalScrollView;
-import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
-import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -40,13 +34,13 @@ import com.openlistsorter.app.network.OpenListClient;
 import com.openlistsorter.app.ui.RemoteDirectoryDialog;
 import com.openlistsorter.app.ui.ZoomImageView;
 
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.util.ArrayList;
 
 public final class MainActivity extends Activity {
     private static final int PAGE_SIZE = 20;
+    private static final int REQUEST_CREATE_DOCUMENT = 1001;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private OpenListClient client;
@@ -65,6 +59,10 @@ public final class MainActivity extends Activity {
     private CheckBox rememberCheck;
     private CheckBox autoLoginCheck;
     private Button connectButton;
+    private Button connectionExitButton;
+    private int passwordModeButtonId;
+    private byte[] pendingDownloadData;
+    private String pendingDownloadName;
 
     private String sourcePath = "/";
     private final ArrayList<Models.FileItem> files = new ArrayList<>();
@@ -78,11 +76,19 @@ public final class MainActivity extends Activity {
     private int preloadGeneration;
 
     private TextView sourcePathView;
+    private Button sourceBrowseButton;
+    private Button downloadCurrentButton;
+    private Button convertCurrentButton;
+    private Button deleteCurrentButton;
     private TextView statsView;
     private TextView pageInfo;
+    private Button previousPageButton;
+    private Button nextPageButton;
     private LinearLayout fileList;
     private TextView previewTitle;
     private TextView previewInfo;
+    private Button previousFileButton;
+    private Button nextFileButton;
     private ZoomImageView imageView;
     private ImageView videoPlaceholder;
     private LinearLayout tagList;
@@ -105,8 +111,36 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        ++preloadGeneration;
+        mainHandler.removeCallbacksAndMessages(null);
         client.shutdown();
         super.onDestroy();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_CREATE_DOCUMENT) {
+            return;
+        }
+        byte[] bytes = pendingDownloadData;
+        String name = pendingDownloadName;
+        pendingDownloadData = null;
+        pendingDownloadName = null;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null || bytes == null) {
+            return;
+        }
+        try (OutputStream output = getContentResolver().openOutputStream(data.getData(), "w")) {
+            if (output == null) {
+                showError("无法打开用户选择的保存位置。");
+                return;
+            }
+            output.write(bytes);
+            output.flush();
+            showInfo("已下载: " + name);
+        } catch (IOException error) {
+            showError("下载保存失败: " + error.getMessage());
+        }
     }
 
     private void showConnectionScreen() {
@@ -127,6 +161,7 @@ public final class MainActivity extends Activity {
         RadioButton passwordMode = radio("账号密码");
         tokenMode.setId(View.generateViewId());
         passwordMode.setId(View.generateViewId());
+        passwordModeButtonId = passwordMode.getId();
         authGroup.addView(tokenMode);
         authGroup.addView(passwordMode);
         tokenMode.setChecked(true);
@@ -170,16 +205,17 @@ public final class MainActivity extends Activity {
         });
 
         status = text(" ", 0xff667085);
+        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         card.addView(status);
         connectButton = primaryButton("连接");
-        Button cancel = button("退出");
+        connectionExitButton = button("退出");
         LinearLayout actions = row();
         actions.setGravity(Gravity.END);
-        actions.addView(cancel);
+        actions.addView(connectionExitButton);
         actions.addView(connectButton);
         card.addView(actions);
         connectButton.setOnClickListener(view -> startConnection());
-        cancel.setOnClickListener(view -> finish());
+        connectionExitButton.setOnClickListener(view -> finish());
 
         endpointEdit.setText(profile.endpoint);
         tokenEdit.setText(profile.token);
@@ -188,6 +224,12 @@ public final class MainActivity extends Activity {
         if (profile.authMode == ConnectionProfile.AuthMode.PASSWORD) {
             passwordMode.setChecked(true);
         }
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.addView(card, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+        root.addView(scroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
         setContentView(root);
     }
 
@@ -203,10 +245,12 @@ public final class MainActivity extends Activity {
         }
         busy = true;
         connectButton.setEnabled(false);
+        connectionExitButton.setEnabled(false);
         status.setText("正在连接...");
         OpenListClient.SimpleCallback callback = (ok, message) -> {
             busy = false;
             connectButton.setEnabled(true);
+            connectionExitButton.setEnabled(true);
             if (!ok) {
                 status.setText("连接失败: " + message);
                 return;
@@ -229,9 +273,7 @@ public final class MainActivity extends Activity {
     private ConnectionProfile readProfile() {
         ConnectionProfile result = new ConnectionProfile();
         result.endpoint = endpointEdit.getText().toString().trim();
-        boolean password = authGroup.getCheckedRadioButtonId() != -1
-                && ((RadioButton) authGroup.findViewById(authGroup.getCheckedRadioButtonId())).getText()
-                .toString().contains("账号");
+        boolean password = authGroup.getCheckedRadioButtonId() == passwordModeButtonId;
         result.authMode = password ? ConnectionProfile.AuthMode.PASSWORD : ConnectionProfile.AuthMode.TOKEN;
         result.token = tokenEdit.getText().toString().trim();
         result.username = usernameEdit.getText().toString().trim();
@@ -253,14 +295,19 @@ public final class MainActivity extends Activity {
         LinearLayout titleRow = row();
         TextView title = heading("OpenList Sorter", 22);
         titleRow.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        Button more = button("更多");
         Button logout = button("注销");
+        titleRow.addView(more);
         titleRow.addView(logout);
         content.addView(titleRow);
+        more.setOnClickListener(view -> showMoreActions());
         logout.setOnClickListener(view -> logout());
 
         status = text("已连接: " + client.getBaseUrl(), 0xff667085);
+        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         content.addView(status);
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progress.setContentDescription("当前操作进度");
         progress.setVisibility(View.GONE);
         content.addView(progress, new LinearLayout.LayoutParams(-1, dp(6)));
 
@@ -268,11 +315,11 @@ public final class MainActivity extends Activity {
         task.addView(heading("分类任务", 17));
         sourcePathView = text(sourcePath, Color.DKGRAY);
         sourcePathView.setTypeface(Typeface.MONOSPACE);
-        Button browse = primaryButton("选择源目录");
+        sourceBrowseButton = primaryButton("选择源目录");
         enterButton = primaryButton("进入分类模式");
         LinearLayout sourceRow = new LinearLayout(this);
         sourceRow.setOrientation(LinearLayout.VERTICAL);
-        sourceRow.addView(browse, new LinearLayout.LayoutParams(-1, -2));
+        sourceRow.addView(sourceBrowseButton, new LinearLayout.LayoutParams(-1, -2));
         sourceRow.addView(sourcePathView, new LinearLayout.LayoutParams(-1, -2));
         sourceRow.addView(enterButton, new LinearLayout.LayoutParams(-1, -2));
         task.addView(sourceRow);
@@ -284,15 +331,15 @@ public final class MainActivity extends Activity {
         options.addView(overwriteCheck);
         options.addView(convertCheck);
         task.addView(options);
-        Button convertCurrent = button("仅转换当前");
-        Button deleteCurrent = button("删除当前");
-        deleteCurrent.setTextColor(Color.WHITE);
-        deleteCurrent.setBackgroundResource(R.drawable.danger_button_background);
-        Button downloadCurrent = button("下载当前");
+        convertCurrentButton = button("仅转换当前");
+        deleteCurrentButton = button("删除当前");
+        deleteCurrentButton.setTextColor(Color.WHITE);
+        deleteCurrentButton.setBackgroundResource(R.drawable.danger_button_background);
+        downloadCurrentButton = button("下载当前");
         LinearLayout fileActions = row();
-        fileActions.addView(downloadCurrent, new LinearLayout.LayoutParams(0, -2, 1));
-        fileActions.addView(convertCurrent, new LinearLayout.LayoutParams(0, -2, 1));
-        fileActions.addView(deleteCurrent, new LinearLayout.LayoutParams(0, -2, 1));
+        fileActions.addView(downloadCurrentButton, new LinearLayout.LayoutParams(0, -2, 1));
+        fileActions.addView(convertCurrentButton, new LinearLayout.LayoutParams(0, -2, 1));
+        fileActions.addView(deleteCurrentButton, new LinearLayout.LayoutParams(0, -2, 1));
         task.addView(fileActions);
         content.addView(task);
 
@@ -303,32 +350,48 @@ public final class MainActivity extends Activity {
         LinearLayout filesPanel = panel();
         filesPanel.addView(heading("当前目录文件", 17));
         LinearLayout pageRow = row();
-        Button previous = button("上一页");
-        Button next = button("下一页");
+        previousPageButton = button("上一页");
+        nextPageButton = button("下一页");
         pageInfo = text("第 0 / 0 页", 0xff667085);
         pageInfo.setGravity(Gravity.CENTER);
-        pageRow.addView(previous);
+        pageRow.addView(previousPageButton);
         pageRow.addView(pageInfo, new LinearLayout.LayoutParams(0, -2, 1));
-        pageRow.addView(next);
+        pageRow.addView(nextPageButton);
         filesPanel.addView(pageRow);
         fileList = new LinearLayout(this);
         fileList.setOrientation(LinearLayout.VERTICAL);
-        filesPanel.addView(fileList);
+        ScrollView fileListScroll = new ScrollView(this);
+        fileListScroll.setFillViewport(true);
+        fileListScroll.addView(fileList, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+        int fileListHeight = Math.max(dp(260), Math.min(dp(380),
+                getResources().getDisplayMetrics().heightPixels / 3));
+        filesPanel.addView(fileListScroll, new LinearLayout.LayoutParams(-1, fileListHeight));
         content.addView(filesPanel);
 
         LinearLayout previewPanel = panel();
+        LinearLayout previewHeader = row();
         previewTitle = heading("预览", 17);
-        previewPanel.addView(previewTitle);
+        previousFileButton = button("上一个");
+        nextFileButton = button("下一个");
+        previewHeader.addView(previewTitle, new LinearLayout.LayoutParams(0, -2, 1));
+        previewHeader.addView(previousFileButton);
+        previewHeader.addView(nextFileButton);
+        previewPanel.addView(previewHeader);
         previewInfo = text("请选择文件", 0xff667085);
         previewInfo.setPadding(dp(10), dp(8), dp(10), dp(8));
         previewInfo.setBackgroundResource(R.drawable.preview_background);
         previewPanel.addView(previewInfo);
         imageView = new ZoomImageView(this);
         imageView.setBackgroundResource(R.drawable.preview_background);
+        imageView.setContentDescription("图片预览，双指缩放，拖动查看");
         imageView.setVisibility(View.GONE);
-        previewPanel.addView(imageView, new LinearLayout.LayoutParams(-1, dp(320)));
+        int previewHeight = Math.max(dp(220), Math.min(dp(420),
+                getResources().getDisplayMetrics().heightPixels / 3));
+        previewPanel.addView(imageView, new LinearLayout.LayoutParams(-1, previewHeight));
         videoPlaceholder = new ImageView(this);
         videoPlaceholder.setImageResource(android.R.drawable.ic_media_play);
+        videoPlaceholder.setContentDescription("在外部播放器中打开视频");
         videoPlaceholder.setVisibility(View.GONE);
         previewPanel.addView(videoPlaceholder, new LinearLayout.LayoutParams(-1, dp(120)));
         content.addView(previewPanel);
@@ -350,7 +413,7 @@ public final class MainActivity extends Activity {
         tagsPanel.addView(saveButton);
         content.addView(tagsPanel);
 
-        browse.setOnClickListener(view -> pickDirectory(sourcePath, selected -> {
+        sourceBrowseButton.setOnClickListener(view -> pickDirectory(sourcePath, selected -> {
             sourcePath = selected;
             sourcePathView.setText(sourcePath);
             saveLocalSettings();
@@ -358,15 +421,17 @@ public final class MainActivity extends Activity {
         enterButton.setOnClickListener(view -> {
             if (classificationMode) exitClassificationMode(); else enterClassificationMode();
         });
-        previous.setOnClickListener(view -> setPage(currentPage - 1));
-        next.setOnClickListener(view -> setPage(currentPage + 1));
+        previousPageButton.setOnClickListener(view -> setPage(currentPage - 1));
+        nextPageButton.setOnClickListener(view -> setPage(currentPage + 1));
+        previousFileButton.setOnClickListener(view -> setCurrentIndex(currentIndex - 1));
+        nextFileButton.setOnClickListener(view -> setCurrentIndex(currentIndex + 1));
         addTag.setOnClickListener(view -> addTag());
         manageTags.setOnClickListener(view -> manageTags());
         clearTags.setOnClickListener(view -> clearCurrentTags());
         saveButton.setOnClickListener(view -> savePending());
-        downloadCurrent.setOnClickListener(view -> downloadCurrent());
-        convertCurrent.setOnClickListener(view -> convertCurrent());
-        deleteCurrent.setOnClickListener(view -> deleteCurrent());
+        downloadCurrentButton.setOnClickListener(view -> downloadCurrent());
+        convertCurrentButton.setOnClickListener(view -> convertCurrent());
+        deleteCurrentButton.setOnClickListener(view -> deleteCurrent());
         overwriteCheck.setOnCheckedChangeListener((button, checked) -> overwrite = checked);
         convertCheck.setOnCheckedChangeListener((button, checked) -> convertOnSave = checked);
         loadLocalSettings();
@@ -382,6 +447,7 @@ public final class MainActivity extends Activity {
         convertOnSave = prefs.getBoolean("convertOnSave", false);
         overwriteCheck.setChecked(overwrite);
         convertCheck.setChecked(convertOnSave);
+        tags.clear();
         int count = prefs.getInt("tagCount", 0);
         for (int i = 0; i < count; i++) {
             String name = prefs.getString("tagName" + i, "");
@@ -450,10 +516,12 @@ public final class MainActivity extends Activity {
     }
 
     private void finishClassificationMode() {
+        ++preloadGeneration;
         classificationMode = false;
         enterButton.setText("进入分类模式");
         files.clear();
         currentIndex = -1;
+        currentPage = 0;
         previewCache.clear();
         renderFileList();
         updateStats();
@@ -464,11 +532,13 @@ public final class MainActivity extends Activity {
         if (index < 0 || index >= files.size()) return;
         currentIndex = index;
         int targetPage = index / PAGE_SIZE;
-        if (targetPage != currentPage) currentPage = targetPage;
+        boolean pageChanged = targetPage != currentPage;
+        if (pageChanged) currentPage = targetPage;
         renderFileList();
         refreshTags();
         updateStats();
         renderCurrentFile();
+        if (pageChanged) preloadCurrentPage();
     }
 
     private void setPage(int page) {
@@ -583,8 +653,11 @@ public final class MainActivity extends Activity {
             if (fileIndex == currentIndex) row.setTextColor(0xff365cf5);
             fileList.addView(row, new LinearLayout.LayoutParams(-1, -2));
         }
-        pageInfo.setText(pageCount() == 0 ? "第 0 / 0 页" : "第 " + (currentPage + 1) + " / " + pageCount()
+        int pages = pageCount();
+        pageInfo.setText(pages == 0 ? "第 0 / 0 页" : "第 " + (currentPage + 1) + " / " + pages
                 + "  " + (start + 1) + "-" + end + " / " + files.size());
+        previousPageButton.setEnabled(classificationMode && !busy && currentPage > 0);
+        nextPageButton.setEnabled(classificationMode && !busy && pages > 0 && currentPage < pages - 1);
     }
 
     private void renderCurrentFile() {
@@ -625,7 +698,9 @@ public final class MainActivity extends Activity {
                 showInfo(formatEntryInfo(item) + "\n\n当前 Android 解码器不支持此图片格式。");
                 return;
             }
-            previewCache.storeImage(item.entry, image);
+            if (ImageConverter.isHeifLike(data, item.entry.name)) {
+                previewCache.storeImage(item.entry, image);
+            }
             imageView.setImageBitmap(image);
             imageView.setVisibility(View.VISIBLE);
             imageView.resetView();
@@ -655,12 +730,13 @@ public final class MainActivity extends Activity {
 
     private void downloadEntry(Models.RemoteEntry entry, java.net.URL url,
                                OpenListClient.DownloadCallback callback, String label) {
-        setBusy(true, label);
+        if (status != null) status.setText(label);
         client.downloadUrl(url, (ok, message, data) -> {
-            setBusy(false, "");
+            if (!busy && progress != null) progress.setVisibility(View.GONE);
             if (ok) previewCache.storeRawData(entry, data);
             callback.onResult(ok, message, data);
         }, (received, total) -> mainHandler.post(() -> {
+            if (isFinishing() || isDestroyed()) return;
             if (progress != null) {
                 progress.setVisibility(View.VISIBLE);
                 progress.setIndeterminate(total <= 0);
@@ -675,9 +751,16 @@ public final class MainActivity extends Activity {
         form.setOrientation(LinearLayout.VERTICAL);
         form.setPadding(dp(20), 0, dp(20), 0);
         EditText name = input("Tag 名称");
-        EditText path = input("目标目录，例如 /分类/旅行");
+        EditText path = input("目标目录");
+        path.setText("/");
+        path.setFocusable(false);
+        Button choosePath = button("选择目录");
+        LinearLayout pathRow = row();
+        pathRow.addView(path, new LinearLayout.LayoutParams(0, -2, 1));
+        pathRow.addView(choosePath);
         form.addView(name);
-        form.addView(path);
+        form.addView(pathRow);
+        choosePath.setOnClickListener(view -> pickDirectory(path.getText().toString(), path::setText));
         new AlertDialog.Builder(this).setTitle("新增 tag").setView(form)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialog, which) -> {
@@ -726,8 +809,14 @@ public final class MainActivity extends Activity {
         EditText path = input("目标目录");
         name.setText(original.name);
         path.setText(original.targetPath);
+        path.setFocusable(false);
+        Button choosePath = button("选择目录");
+        LinearLayout pathRow = row();
+        pathRow.addView(path, new LinearLayout.LayoutParams(0, -2, 1));
+        pathRow.addView(choosePath);
         form.addView(name);
-        form.addView(path);
+        form.addView(pathRow);
+        choosePath.setOnClickListener(view -> pickDirectory(path.getText().toString(), path::setText));
         new AlertDialog.Builder(this).setTitle("编辑 tag").setView(form)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialog, which) -> {
@@ -784,7 +873,7 @@ public final class MainActivity extends Activity {
             check.setText(tag.name + "\n" + tag.targetPath);
             check.setTag(tag.name);
             Models.FileItem item = currentIndex >= 0 && currentIndex < files.size() ? files.get(currentIndex) : null;
-            check.setEnabled(classificationMode && item != null && !item.submitted);
+            check.setEnabled(classificationMode && item != null && !item.submitted && !busy);
             check.setChecked(item != null && item.selectedTags.contains(tag.name));
             check.setOnCheckedChangeListener((button, checked) -> {
                 if (currentIndex < 0 || currentIndex >= files.size()) return;
@@ -863,21 +952,23 @@ public final class MainActivity extends Activity {
 
     private void submitFile(int index, OpenListClient.SimpleCallback callback) {
         Models.FileItem item = files.get(index);
-        ArrayList<String> targets = new ArrayList<>();
+        ArrayList<String> uniqueTargets = new ArrayList<>();
+        ArrayList<String> selectedTargets = new ArrayList<>();
         for (String selected : item.selectedTags) {
             Models.TagMapping tag = findTag(selected);
             if (tag == null) {
                 callback.onResult(false, "tag 没有绑定目标目录: " + selected);
                 return;
             }
-            if (!targets.contains(tag.targetPath)) targets.add(tag.targetPath);
+            selectedTargets.add(tag.targetPath);
+            if (!uniqueTargets.contains(tag.targetPath)) uniqueTargets.add(tag.targetPath);
         }
         if (convertOnSave && Models.isImageFileName(item.entry.name)) {
-            submitConverted(index, targets, callback);
-        } else if (targets.size() == 1) {
-            client.moveFile(sourcePath, item.entry.name, targets.get(0), overwrite, callback);
+            submitConverted(index, uniqueTargets, callback);
+        } else if (item.selectedTags.size() == 1) {
+            client.moveFile(sourcePath, item.entry.name, selectedTargets.get(0), overwrite, callback);
         } else {
-            copyTargets(index, targets, 0, callback);
+            copyTargets(index, selectedTargets, 0, callback);
         }
     }
 
@@ -902,8 +993,23 @@ public final class MainActivity extends Activity {
                 return;
             }
             new Thread(() -> {
-                ImageConverter.Result converted = ImageConverter.convertToWebp(data, item.entry.name);
+                byte[] conversionData = data;
+                String hashSource = "原始文件";
+                if (ImageConverter.isHeifLike(data, item.entry.name)) {
+                    conversionData = previewCache.loadDecodedJpeg(item.entry);
+                    if (conversionData == null) {
+                        conversionData = ImageConverter.decodeToFullQualityJpeg(data);
+                        if (conversionData != null) {
+                            previewCache.storeDecodedJpeg(item.entry, conversionData);
+                        }
+                    }
+                    hashSource = "HEIF 解码 JPG 缓存";
+                }
+                final ImageConverter.Result converted = conversionData == null
+                        ? conversionFailure(hashSource, "HEIF/AVIF 解码缓存生成失败。")
+                        : ImageConverter.convertToWebp(conversionData, hashSource);
                 mainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed()) return;
                     if (!converted.ok) {
                         callback.onResult(false, converted.message);
                         return;
@@ -931,6 +1037,13 @@ public final class MainActivity extends Activity {
             }
             boolean duplicate = false;
             for (Models.RemoteEntry entry : entries) {
+                if (entry.isDir || !Models.lowerSuffix(entry.name).equals("webp")) {
+                    continue;
+                }
+                if (index >= 0 && index < files.size()
+                        && entry.path.equals(files.get(index).entry.path)) {
+                    continue;
+                }
                 String base = entry.name;
                 int dot = base.lastIndexOf('.');
                 if (dot > 0) base = base.substring(0, dot);
@@ -943,6 +1056,12 @@ public final class MainActivity extends Activity {
                 uploadConverted(index, converted, targets, position + 1, callback);
                 return;
             }
+            if (index >= 0 && index < files.size()
+                    && Models.normalizeRemotePath(uploadPath)
+                    .equals(Models.normalizeRemotePath(files.get(index).entry.path))) {
+                callback.onResult(false, "当前文件已经是目标 WebP 文件，无需转换。");
+                return;
+            }
             client.uploadFile(uploadPath, converted.data, overwrite, (uploadOk, uploadMessage) -> {
                 if (!uploadOk) callback.onResult(false, "上传 WebP 失败: " + uploadMessage);
                 else uploadConverted(index, converted, targets, position + 1, callback);
@@ -953,27 +1072,25 @@ public final class MainActivity extends Activity {
     private void downloadCurrent() {
         if (currentIndex < 0 || currentIndex >= files.size() || busy) return;
         Models.FileItem item = files.get(currentIndex);
+        setBusy(true, "正在下载 " + item.entry.name);
         fetchFileData(item, (ok, message, data) -> {
+            setBusy(false, "");
             if (!ok) {
                 showError("下载失败: " + message);
                 return;
             }
-            File downloadDirectory = getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS);
-            if (downloadDirectory == null && getCacheDir() != null) {
-                downloadDirectory = new File(getCacheDir(), "downloads");
-            }
-            if (downloadDirectory == null || (!downloadDirectory.exists() && !downloadDirectory.mkdirs())) {
-                showError("无法创建下载目录");
-                return;
-            }
-            String safeName = item.entry.name.replaceAll("[\\\\/:*?\\\"<>|]", "_");
-            File target = new File(downloadDirectory, safeName);
-            try (FileOutputStream output = new FileOutputStream(target)) {
-                output.write(data);
-                output.flush();
-                showInfo("已下载: " + target.getAbsolutePath());
-            } catch (IOException error) {
-                showError("下载保存失败: " + error.getMessage());
+            pendingDownloadData = data;
+            pendingDownloadName = item.entry.name;
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("application/octet-stream");
+            intent.putExtra(Intent.EXTRA_TITLE, item.entry.name);
+            try {
+                startActivityForResult(intent, REQUEST_CREATE_DOCUMENT);
+            } catch (ActivityNotFoundException error) {
+                pendingDownloadData = null;
+                pendingDownloadName = null;
+                showError("系统没有可用的文件保存界面。");
             }
         }, "正在下载 " + item.entry.name);
     }
@@ -981,6 +1098,10 @@ public final class MainActivity extends Activity {
     private void convertCurrent() {
         if (currentIndex < 0 || currentIndex >= files.size() || busy) return;
         Models.FileItem item = files.get(currentIndex);
+        if (item.submitted) {
+            showError("当前文件已经提交过，请刷新目录后再转换。");
+            return;
+        }
         if (!Models.isImageFileName(item.entry.name)) {
             showError("当前文件不是可转换的图片");
             return;
@@ -989,12 +1110,19 @@ public final class MainActivity extends Activity {
                 .setMessage("转 WebP 上传回原目录，成功后删除原文件。继续吗？")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("转换", (dialog, which) -> {
+                    final int conversionIndex = currentIndex;
                     ArrayList<String> targets = new ArrayList<>();
                     targets.add(Models.parentRemotePath(item.entry.path));
-                    submitConverted(currentIndex, targets, (ok, message) -> {
-                        item.submitted = ok;
-                        item.failed = !ok;
-                        item.lastError = ok ? "" : message;
+                    ++preloadGeneration;
+                    setBusy(true, "正在转换当前图片: " + item.entry.name);
+                    submitConverted(conversionIndex, targets, (ok, message) -> {
+                        setBusy(false, "");
+                        if (conversionIndex >= 0 && conversionIndex < files.size()
+                                && files.get(conversionIndex).entry.path.equals(item.entry.path)) {
+                            item.submitted = ok;
+                            item.failed = !ok;
+                            item.lastError = ok ? "" : message;
+                        }
                         renderFileList();
                         updateStats();
                         if (ok) showInfo(message); else showError(message);
@@ -1005,24 +1133,102 @@ public final class MainActivity extends Activity {
     private void deleteCurrent() {
         if (currentIndex < 0 || currentIndex >= files.size() || busy) return;
         Models.FileItem item = files.get(currentIndex);
+        if (item.submitted) {
+            showError("当前文件已经提交过，源位置可能已变化，请刷新目录后再删除。");
+            return;
+        }
+        final int deleteIndex = currentIndex;
         new AlertDialog.Builder(this).setTitle("确认删除远程文件")
-                .setMessage("此操作不可撤销。\n\n" + item.entry.path)
+                .setMessage("此操作会直接删除远程文件，无法撤销。\n\n文件: "
+                        + item.entry.name + "\n路径: " + item.entry.path)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("删除", (dialog, which) -> client.removeFile(
-                        Models.parentRemotePath(item.entry.path), item.entry.name, (ok, message) -> {
-                            if (!ok) {
-                                item.failed = true;
-                                item.lastError = message;
-                                showError("删除失败: " + message);
-                                return;
-                            }
-                            files.remove(item);
-                            currentIndex = Math.min(currentIndex, files.size() - 1);
-                            currentPage = Math.max(0, currentIndex / PAGE_SIZE);
-                            renderFileList();
-                            updateStats();
-                            renderCurrentFile();
-                        })).show();
+                .setPositiveButton("删除", (dialog, which) ->
+                        new AlertDialog.Builder(this).setTitle("最终确认删除")
+                                .setMessage("确认后将立即向 OpenList 提交删除请求。\n\n" + item.entry.path)
+                                .setNegativeButton("取消", null)
+                                .setPositiveButton("确认删除", (finalDialog, finalWhich) -> {
+                                    ++preloadGeneration;
+                                    setBusy(true, "正在删除远程文件: " + item.entry.name);
+                                    client.removeFile(Models.parentRemotePath(item.entry.path), item.entry.name,
+                                            (ok, message) -> {
+                                                setBusy(false, "");
+                                                if (!ok) {
+                                                    if (deleteIndex >= 0 && deleteIndex < files.size()
+                                                            && files.get(deleteIndex).entry.path.equals(item.entry.path)) {
+                                                        item.failed = true;
+                                                        item.lastError = message;
+                                                    }
+                                                    showError("删除失败: " + message);
+                                                    renderFileList();
+                                                    return;
+                                                }
+                                                files.remove(item);
+                                                currentIndex = Math.min(deleteIndex, files.size() - 1);
+                                                currentPage = Math.max(0, currentIndex / PAGE_SIZE);
+                                                renderFileList();
+                                                updateStats();
+                                                renderCurrentFile();
+                                            });
+                                }).show()).show();
+    }
+
+    private void showMoreActions() {
+        String[] actions = {"连接信息", "清空全部未提交选择", "清理预览缓存", "关于"};
+        new AlertDialog.Builder(this).setTitle("更多操作").setItems(actions, (dialog, which) -> {
+            if (which == 0) {
+                showConnectionDiagnostics();
+            } else if (which == 1) {
+                clearAllPendingSelections();
+            } else if (which == 2) {
+                previewCache.clear();
+                showInfo("预览缓存已清理");
+                renderCurrentFile();
+            } else {
+                showInfo("关于", "OpenList Sorter Android 0.1.0\n\n基于 Qt 版工作流实现的 OpenList 远程文件分类工具。");
+            }
+        }).show();
+    }
+
+    private void showConnectionDiagnostics() {
+        setBusy(true, "正在检测连接...");
+        client.fetchConnectionDiagnostics(diagnostics -> {
+            setBusy(false, "");
+            String detail = "Endpoint: " + diagnostics.endpoint
+                    + "\n状态: " + (diagnostics.connected ? "已连接" : "未连接")
+                    + "\n延迟: " + (diagnostics.latencyMs >= 0 ? diagnostics.latencyMs + " ms" : "未知")
+                    + "\nIP: " + (diagnostics.ipAddress.isEmpty() ? "未知" : diagnostics.ipAddress)
+                    + "\n远端版本: " + (diagnostics.version.isEmpty() ? "未知" : diagnostics.version)
+                    + "\n站点标题: " + (diagnostics.siteTitle.isEmpty() ? "未知" : diagnostics.siteTitle)
+                    + (diagnostics.message.isEmpty() ? "" : "\n信息: " + diagnostics.message);
+            showInfo("连接信息", detail);
+        });
+    }
+
+    private void clearAllPendingSelections() {
+        int count = 0;
+        for (Models.FileItem item : files) {
+            if (!item.submitted && !item.selectedTags.isEmpty()) count++;
+        }
+        if (count == 0) {
+            showInfo("当前没有待清空的选择");
+            return;
+        }
+        final int pending = count;
+        new AlertDialog.Builder(this).setTitle("清空全部未提交选择")
+                .setMessage("将清空 " + pending + " 个文件的本地 tag 选择，不会修改远程文件。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("清空", (dialog, which) -> {
+                    for (Models.FileItem item : files) {
+                        if (!item.submitted) {
+                            item.selectedTags.clear();
+                            item.failed = false;
+                            item.lastError = "";
+                        }
+                    }
+                    refreshTags();
+                    renderFileList();
+                    updateStats();
+                }).show();
     }
 
     private void logout() {
@@ -1035,14 +1241,45 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("取消", null)
                 .setPositiveButton("注销", (dialog, which) -> {
                     ConnectionStore.disableAutoLogin(this);
-                    client.clearConnection();
+                    profile.autoLogin = false;
+                    ++preloadGeneration;
+                    client.shutdown();
+                    client = new OpenListClient();
                     showConnectionScreen();
                 }).show();
     }
 
     private void openRemote(Models.FileItem item) {
+        if (item.entry.rawUrl.isEmpty()) {
+            setBusy(true, "正在获取视频地址: " + item.entry.name);
+            client.getFileInfo(item.entry.path, (ok, message, entry) -> {
+                setBusy(false, "");
+                if (!ok || entry.rawUrl.isEmpty()) {
+                    showError(ok ? "OpenList 没有返回视频地址。" : message);
+                    return;
+                }
+                item.entry.rawUrl = entry.rawUrl;
+                openRemote(item);
+            });
+            return;
+        }
         java.net.URL url = OpenListClient.resolveUrl(client.getBaseUrl(), item.entry.rawUrl);
-        if (url != null) startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url.toString())));
+        if (url == null) {
+            showError("视频地址无效。");
+            return;
+        }
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url.toString())));
+        } catch (ActivityNotFoundException error) {
+            showError("系统没有可用的视频播放器。");
+        }
+    }
+
+    private static ImageConverter.Result conversionFailure(String hashSource, String message) {
+        ImageConverter.Result result = new ImageConverter.Result();
+        result.hashSource = hashSource;
+        result.message = message;
+        return result;
     }
 
     private Models.TagMapping findTag(String name) {
@@ -1067,7 +1304,17 @@ public final class MainActivity extends Activity {
         statsView.setText("总文件 " + files.size() + " | 已提交 " + submitted + " | 待保存 "
                 + pending + " | 未处理 " + (files.size() - submitted - pending)
                 + " | 当前 " + (currentIndex < 0 ? 0 : currentIndex + 1));
+        Models.FileItem current = currentIndex >= 0 && currentIndex < files.size()
+                ? files.get(currentIndex) : null;
         if (saveButton != null) saveButton.setEnabled(classificationMode && pending > 0 && !busy);
+        if (sourceBrowseButton != null) sourceBrowseButton.setEnabled(!classificationMode && !busy);
+        if (downloadCurrentButton != null) downloadCurrentButton.setEnabled(current != null && !busy);
+        if (convertCurrentButton != null) convertCurrentButton.setEnabled(current != null && !current.submitted
+                && Models.isImageFileName(current.entry.name) && !busy);
+        if (deleteCurrentButton != null) deleteCurrentButton.setEnabled(current != null && !current.submitted && !busy);
+        if (previousFileButton != null) previousFileButton.setEnabled(currentIndex > 0 && !busy);
+        if (nextFileButton != null) nextFileButton.setEnabled(currentIndex >= 0
+                && currentIndex < files.size() - 1 && !busy);
     }
 
     private void setBusy(boolean value, String message) {
@@ -1079,6 +1326,8 @@ public final class MainActivity extends Activity {
         if (status != null && message != null && !message.isEmpty()) status.setText(message);
         if (enterButton != null) enterButton.setEnabled(!value);
         updateStats();
+        if (fileList != null) renderFileList();
+        if (tagList != null) refreshTags();
     }
 
     private void showInfo(String message) {
@@ -1162,7 +1411,10 @@ public final class MainActivity extends Activity {
     private LinearLayout labelled(String label, View child) {
         LinearLayout value = new LinearLayout(this);
         value.setOrientation(LinearLayout.VERTICAL);
-        value.addView(text(label, 0xff667085));
+        TextView labelView = text(label, 0xff667085);
+        if (child.getId() == View.NO_ID) child.setId(View.generateViewId());
+        labelView.setLabelFor(child.getId());
+        value.addView(labelView);
         value.addView(child, new LinearLayout.LayoutParams(-1, -2));
         return value;
     }

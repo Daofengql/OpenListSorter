@@ -34,8 +34,16 @@ public final class PreviewCache {
         return write(fileFor(entry, "raw", ".bin"), data);
     }
 
+    public byte[] loadDecodedJpeg(RemoteEntry entry) {
+        return read(fileFor(entry, "decoded-jpeg", ".jpg"));
+    }
+
+    public boolean storeDecodedJpeg(RemoteEntry entry, byte[] data) {
+        return write(fileFor(entry, "decoded-jpeg", ".jpg"), data);
+    }
+
     public Bitmap loadImage(RemoteEntry entry) {
-        byte[] data = read(fileFor(entry, "preview", ".webp"));
+        byte[] data = loadDecodedJpeg(entry);
         return data == null ? null : BitmapFactory.decodeByteArray(data, 0, data.length);
     }
 
@@ -44,10 +52,10 @@ public final class PreviewCache {
             return false;
         }
         ByteArrayOutputStream output = new ByteArrayOutputStream();
-        if (!image.compress(Bitmap.CompressFormat.WEBP, 100, output)) {
+        if (!image.compress(Bitmap.CompressFormat.JPEG, 100, output)) {
             return false;
         }
-        return write(fileFor(entry, "preview", ".webp"), output.toByteArray());
+        return storeDecodedJpeg(entry, output.toByteArray());
     }
 
     public File rawFile(RemoteEntry entry) {

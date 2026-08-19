@@ -38,33 +38,32 @@ public final class ImageConverter {
         return BitmapFactory.decodeByteArray(data, 0, data.length);
     }
 
-    public static Result convertToWebp(byte[] original, String sourceName) {
+    public static byte[] decodeToFullQualityJpeg(byte[] data) {
+        Bitmap bitmap = decode(data);
+        if (bitmap == null) {
+            return null;
+        }
+        ByteArrayOutputStream jpeg = new ByteArrayOutputStream();
+        boolean encoded = bitmap.compress(Bitmap.CompressFormat.JPEG, 100, jpeg);
+        bitmap.recycle();
+        return encoded && jpeg.size() > 0 ? jpeg.toByteArray() : null;
+    }
+
+    public static Result convertToWebp(byte[] data, String hashSource) {
         Result result = new Result();
-        if (original == null || original.length == 0) {
+        if (data == null || data.length == 0) {
             result.message = "图片数据为空，无法转换。";
             return result;
         }
-        Bitmap bitmap = decode(original);
+        Bitmap bitmap = decode(data);
         if (bitmap == null) {
             result.message = "Android 图片解码器不支持当前格式，无法转 WebP。";
             return result;
         }
 
-        byte[] hashData = original;
-        result.hashSource = "原始文件";
-        if (isHeifLike(original, sourceName)) {
-            ByteArrayOutputStream jpeg = new ByteArrayOutputStream();
-            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 100, jpeg)) {
-                result.message = "HEIF/AVIF 解码缓存生成失败。";
-                bitmap.recycle();
-                return result;
-            }
-            hashData = jpeg.toByteArray();
-            result.hashSource = "HEIF 解码 JPG 缓存";
-        }
-
-        result.sha256 = PreviewCache.sha256(hashData);
-        result.md5 = PreviewCache.md5(hashData);
+        result.hashSource = hashSource;
+        result.sha256 = PreviewCache.sha256(data);
+        result.md5 = PreviewCache.md5(data);
         result.outputName = result.sha256 + ".webp";
         ByteArrayOutputStream webp = new ByteArrayOutputStream();
         Bitmap.CompressFormat format = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R

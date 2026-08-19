@@ -63,10 +63,15 @@ public final class ZoomImageView extends ImageView {
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        if (getParent() != null && (event.getPointerCount() > 1 || scale > 1f)) {
+            getParent().requestDisallowInterceptTouchEvent(true);
+        }
         boolean scaled = scaleDetector.onTouchEvent(event);
         boolean gestured = gestureDetector.onTouchEvent(event);
-        if (event.getAction() == MotionEvent.ACTION_UP && !scaled) {
-            performClick();
+        if (event.getActionMasked() == MotionEvent.ACTION_UP
+                || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+            if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(false);
+            if (!scaled) performClick();
         }
         return scaled || gestured || super.onTouchEvent(event);
     }

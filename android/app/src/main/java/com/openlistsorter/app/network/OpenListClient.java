@@ -67,6 +67,7 @@ public final class OpenListClient {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newCachedThreadPool();
+    private volatile boolean closed;
     private volatile String baseUrl = "";
     private volatile String token = "";
 
@@ -137,7 +138,8 @@ public final class OpenListClient {
             if (result.error.isEmpty()) {
                 try {
                     JSONObject root = new JSONObject(new String(result.body, StandardCharsets.UTF_8));
-                    diagnostics.publicSettingsOk = root.optInt("code", -1) == 200;
+                    diagnostics.publicSettingsOk = result.status >= 200 && result.status < 300
+                            && root.optInt("code", -1) == 200;
                     diagnostics.message = firstNonEmpty(root.optString("message", ""), root.optString("msg", ""));
                     JSONObject data = root.optJSONObject("data");
                     if (data != null) {
@@ -295,6 +297,8 @@ public final class OpenListClient {
     }
 
     public void shutdown() {
+        closed = true;
+        mainHandler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
     }
 
@@ -324,6 +328,10 @@ public final class OpenListClient {
                     payload.toString().getBytes(StandardCharsets.UTF_8), null);
             if (!result.error.isEmpty()) {
                 post(callback, false, result.error, new JSONObject());
+                return;
+            }
+            if (result.status < 200 || result.status >= 300) {
+                post(callback, false, "HTTP 状态码 " + result.status, new JSONObject());
                 return;
             }
             ApiResponse api = parseApi(result.body);
@@ -483,29 +491,40 @@ public final class OpenListClient {
         return first == null || first.isEmpty() ? (second == null ? "" : second) : first;
     }
 
+    private void runOnMain(Runnable callback) {
+        if (closed) {
+            return;
+        }
+        mainHandler.post(() -> {
+            if (!closed) {
+                callback.run();
+            }
+        });
+    }
+
     private void post(SimpleCallback callback, boolean ok, String message) {
-        mainHandler.post(() -> callback.onResult(ok, message == null ? "" : message));
+        runOnMain(() -> callback.onResult(ok, message == null ? "" : message));
     }
 
     private void post(ListCallback callback, boolean ok, String message, String path,
                       ArrayList<Models.RemoteEntry> entries) {
-        mainHandler.post(() -> callback.onResult(ok, message == null ? "" : message, path, entries));
+        runOnMain(() -> callback.onResult(ok, message == null ? "" : message, path, entries));
     }
 
     private void post(EntryCallback callback, boolean ok, String message, Models.RemoteEntry entry) {
-        mainHandler.post(() -> callback.onResult(ok, message == null ? "" : message, entry));
+        runOnMain(() -> callback.onResult(ok, message == null ? "" : message, entry));
     }
 
     private void post(DownloadCallback callback, boolean ok, String message, byte[] data) {
-        mainHandler.post(() -> callback.onResult(ok, message == null ? "" : message, data));
+        runOnMain(() -> callback.onResult(ok, message == null ? "" : message, data));
     }
 
     private void post(JsonCallback callback, boolean ok, String message, JSONObject data) {
-        mainHandler.post(() -> callback.onResult(ok, message == null ? "" : message, data));
+        runOnMain(() -> callback.onResult(ok, message == null ? "" : message, data));
     }
 
     private void post(java.util.function.Consumer<ConnectionDiagnostics> callback,
                       ConnectionDiagnostics diagnostics) {
-        mainHandler.post(() -> callback.accept(diagnostics));
+        runOnMain(() -> callback.accept(diagnostics));
     }
 }
