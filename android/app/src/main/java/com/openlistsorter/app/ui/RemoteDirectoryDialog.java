@@ -1,6 +1,6 @@
 package com.openlistsorter.app.ui;
 
-import android.app.AlertDialog;
+import androidx.appcompat.app.AlertDialog;
 import android.content.Context;
 import android.graphics.Typeface;
 import android.view.View;
@@ -9,6 +9,9 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.TextView;
+
+import com.google.android.material.button.MaterialButton;
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 
 import com.openlistsorter.app.data.Models;
 import com.openlistsorter.app.network.OpenListClient;
@@ -74,7 +77,7 @@ public final class RemoteDirectoryDialog {
         statusView.setPadding(0, dp(8), 0, 0);
         root.addView(statusView);
 
-        dialog = new AlertDialog.Builder(context)
+        dialog = new MaterialAlertDialogBuilder(context)
                 .setTitle("选择远程目录")
                 .setView(root)
                 .setNegativeButton("取消", null)
@@ -156,9 +159,13 @@ public final class RemoteDirectoryDialog {
     }
 
     private Button button(String text) {
-        Button button = new Button(context);
+        MaterialButton button = new MaterialButton(context, null,
+                com.google.android.material.R.attr.materialButtonOutlinedStyle);
         button.setText(text);
         button.setAllCaps(false);
+        button.setMinHeight(dp(44));
+        button.setInsetTop(0);
+        button.setInsetBottom(0);
         return button;
     }
 

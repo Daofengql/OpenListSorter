@@ -1,9 +1,9 @@
 package com.openlistsorter.app;
 
-import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.Context;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
@@ -24,6 +25,18 @@ import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+import com.google.android.material.button.MaterialButton;
+import com.google.android.material.card.MaterialCardView;
+import com.google.android.material.progressindicator.CircularProgressIndicator;
+import com.google.android.material.checkbox.MaterialCheckBox;
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+import com.google.android.material.progressindicator.LinearProgressIndicator;
+import com.google.android.material.radiobutton.MaterialRadioButton;
+import com.google.android.material.textfield.TextInputEditText;
+import com.google.android.material.textfield.TextInputLayout;
 
 import com.openlistsorter.app.data.ConnectionProfile;
 import com.openlistsorter.app.data.ConnectionStore;
@@ -38,11 +51,14 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
 
-public final class MainActivity extends Activity {
+public final class MainActivity extends AppCompatActivity {
     private static final int PAGE_SIZE = 20;
     private static final int REQUEST_CREATE_DOCUMENT = 1001;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private Runnable delayedAutoLogin;
+    private Runnable connectionTimeout;
+    private int connectionGeneration;
     private OpenListClient client;
     private PreviewCache previewCache;
     private ConnectionProfile profile;
@@ -60,6 +76,7 @@ public final class MainActivity extends Activity {
     private CheckBox autoLoginCheck;
     private Button connectButton;
     private Button connectionExitButton;
+    private CircularProgressIndicator connectionProgress;
     private int passwordModeButtonId;
     private byte[] pendingDownloadData;
     private String pendingDownloadName;
@@ -105,13 +122,17 @@ public final class MainActivity extends Activity {
         profile = ConnectionStore.load(this);
         showConnectionScreen();
         if (profile.autoLogin && profile.hasCredentials()) {
-            mainHandler.postDelayed(this::startConnection, 180);
+            delayedAutoLogin = this::startConnection;
+            mainHandler.postDelayed(delayedAutoLogin, 180);
         }
     }
 
     @Override
     protected void onDestroy() {
         ++preloadGeneration;
+        ++connectionGeneration;
+        delayedAutoLogin = null;
+        connectionTimeout = null;
         mainHandler.removeCallbacksAndMessages(null);
         client.shutdown();
         super.onDestroy();
@@ -146,7 +167,7 @@ public final class MainActivity extends Activity {
     private void showConnectionScreen() {
         root = baseRoot();
         root.setPadding(dp(16), dp(20), dp(16), dp(16));
-        LinearLayout card = panel();
+        MaterialPanel card = panel();
         TextView title = heading("连接到 OpenList", 24);
         card.addView(title);
         TextView subtitle = text("使用 endpoint + token key，或使用账号密码登录。", 0xff667085);
@@ -188,9 +209,9 @@ public final class MainActivity extends Activity {
             passwordFields.setVisibility(password ? View.VISIBLE : View.GONE);
         });
 
-        rememberCheck = new CheckBox(this);
+        rememberCheck = new MaterialCheckBox(this);
         rememberCheck.setText("记住我");
-        autoLoginCheck = new CheckBox(this);
+        autoLoginCheck = new MaterialCheckBox(this);
         autoLoginCheck.setText("自动登录");
         LinearLayout checks = row();
         checks.addView(rememberCheck);
@@ -207,6 +228,11 @@ public final class MainActivity extends Activity {
         status = text(" ", 0xff667085);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         card.addView(status);
+        connectionProgress = new CircularProgressIndicator(this);
+        connectionProgress.setIndeterminate(true);
+        connectionProgress.setVisibility(View.GONE);
+        connectionProgress.setContentDescription("正在连接");
+        card.addView(connectionProgress, new LinearLayout.LayoutParams(dp(32), dp(32)));
         connectButton = primaryButton("连接");
         connectionExitButton = button("退出");
         LinearLayout actions = row();
@@ -234,6 +260,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startConnection() {
+        if (busy) return;
         ConnectionProfile requested = readProfile();
         if (requested.endpoint.isEmpty()) {
             showError("请输入 endpoint");
@@ -243,14 +270,31 @@ public final class MainActivity extends Activity {
             showError("请输入 token key，或完整的用户名和密码");
             return;
         }
+        final int attempt = ++connectionGeneration;
         busy = true;
         connectButton.setEnabled(false);
         connectionExitButton.setEnabled(false);
+        connectionProgress.setVisibility(View.VISIBLE);
         status.setText("正在连接...");
-        OpenListClient.SimpleCallback callback = (ok, message) -> {
+        connectionTimeout = () -> {
+            if (attempt != connectionGeneration || !busy) return;
             busy = false;
             connectButton.setEnabled(true);
             connectionExitButton.setEnabled(true);
+            connectionProgress.setVisibility(View.GONE);
+            status.setText("连接超时，请检查 endpoint、网络和证书后重试。");
+            client.shutdown();
+            client = new OpenListClient();
+        };
+        mainHandler.postDelayed(connectionTimeout, 20000L);
+        OpenListClient.SimpleCallback callback = (ok, message) -> {
+            if (attempt != connectionGeneration) return;
+            if (connectionTimeout != null) mainHandler.removeCallbacks(connectionTimeout);
+            connectionTimeout = null;
+            busy = false;
+            connectButton.setEnabled(true);
+            connectionExitButton.setEnabled(true);
+            connectionProgress.setVisibility(View.GONE);
             if (!ok) {
                 status.setText("连接失败: " + message);
                 return;
@@ -306,12 +350,13 @@ public final class MainActivity extends Activity {
         status = text("已连接: " + client.getBaseUrl(), 0xff667085);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         content.addView(status);
-        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progress = new LinearProgressIndicator(this);
         progress.setContentDescription("当前操作进度");
+        progress.setIndeterminate(true);
         progress.setVisibility(View.GONE);
         content.addView(progress, new LinearLayout.LayoutParams(-1, dp(6)));
 
-        LinearLayout task = panel();
+        MaterialPanel task = panel();
         task.addView(heading("分类任务", 17));
         sourcePathView = text(sourcePath, Color.DKGRAY);
         sourcePathView.setTypeface(Typeface.MONOSPACE);
@@ -324,17 +369,21 @@ public final class MainActivity extends Activity {
         sourceRow.addView(enterButton, new LinearLayout.LayoutParams(-1, -2));
         task.addView(sourceRow);
         LinearLayout options = row();
-        overwriteCheck = new CheckBox(this);
+        overwriteCheck = new MaterialCheckBox(this);
         overwriteCheck.setText("覆盖同名文件");
-        convertCheck = new CheckBox(this);
+        convertCheck = new MaterialCheckBox(this);
         convertCheck.setText("保存时转 WebP");
         options.addView(overwriteCheck);
         options.addView(convertCheck);
         task.addView(options);
         convertCurrentButton = button("仅转换当前");
         deleteCurrentButton = button("删除当前");
-        deleteCurrentButton.setTextColor(Color.WHITE);
-        deleteCurrentButton.setBackgroundResource(R.drawable.danger_button_background);
+        deleteCurrentButton.setTextColor(0xffb3261e);
+        if (deleteCurrentButton instanceof MaterialButton) {
+            MaterialButton danger = (MaterialButton) deleteCurrentButton;
+            danger.setStrokeColor(ColorStateList.valueOf(0xffb3261e));
+            danger.setStrokeWidth(dp(1));
+        }
         downloadCurrentButton = button("下载当前");
         LinearLayout fileActions = row();
         fileActions.addView(downloadCurrentButton, new LinearLayout.LayoutParams(0, -2, 1));
@@ -347,7 +396,7 @@ public final class MainActivity extends Activity {
         statsView.setPadding(0, dp(10), 0, dp(10));
         content.addView(statsView);
 
-        LinearLayout filesPanel = panel();
+        MaterialPanel filesPanel = panel();
         filesPanel.addView(heading("当前目录文件", 17));
         LinearLayout pageRow = row();
         previousPageButton = button("上一页");
@@ -369,7 +418,7 @@ public final class MainActivity extends Activity {
         filesPanel.addView(fileListScroll, new LinearLayout.LayoutParams(-1, fileListHeight));
         content.addView(filesPanel);
 
-        LinearLayout previewPanel = panel();
+        MaterialPanel previewPanel = panel();
         LinearLayout previewHeader = row();
         previewTitle = heading("预览", 17);
         previousFileButton = button("上一个");
@@ -396,7 +445,7 @@ public final class MainActivity extends Activity {
         previewPanel.addView(videoPlaceholder, new LinearLayout.LayoutParams(-1, dp(120)));
         content.addView(previewPanel);
 
-        LinearLayout tagsPanel = panel();
+        MaterialPanel tagsPanel = panel();
         tagsPanel.addView(heading("分类 tag", 17));
         Button addTag = button("新增 tag");
         Button manageTags = button("管理 tag");
@@ -506,7 +555,7 @@ public final class MainActivity extends Activity {
     private void exitClassificationMode() {
         int pending = pendingCount();
         if (pending > 0) {
-            new AlertDialog.Builder(this).setTitle("退出分类模式")
+            new MaterialAlertDialogBuilder(this).setTitle("退出分类模式")
                     .setMessage("当前有 " + pending + " 个已选择但未保存的文件，退出会放弃选择。继续吗？")
                     .setNegativeButton("取消", null)
                     .setPositiveButton("退出", (dialog, which) -> finishClassificationMode()).show();
@@ -756,12 +805,12 @@ public final class MainActivity extends Activity {
         path.setFocusable(false);
         Button choosePath = button("选择目录");
         LinearLayout pathRow = row();
-        pathRow.addView(path, new LinearLayout.LayoutParams(0, -2, 1));
+        pathRow.addView(labelled("目标目录", path), new LinearLayout.LayoutParams(0, -2, 1));
         pathRow.addView(choosePath);
-        form.addView(name);
+        form.addView(labelled("Tag 名称", name));
         form.addView(pathRow);
         choosePath.setOnClickListener(view -> pickDirectory(path.getText().toString(), path::setText));
-        new AlertDialog.Builder(this).setTitle("新增 tag").setView(form)
+        new MaterialAlertDialogBuilder(this).setTitle("新增 tag").setView(form)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialog, which) -> {
                     String tagName = name.getText().toString().trim();
@@ -791,8 +840,8 @@ public final class MainActivity extends Activity {
         for (int i = 0; i < tags.size(); i++) {
             labels[i] = tags.get(i).name + "  ->  " + tags.get(i).targetPath;
         }
-        new AlertDialog.Builder(this).setTitle("管理 tag").setItems(labels, (dialog, which) ->
-                new AlertDialog.Builder(this).setTitle(tags.get(which).name)
+        new MaterialAlertDialogBuilder(this).setTitle("管理 tag").setItems(labels, (dialog, which) ->
+                new MaterialAlertDialogBuilder(this).setTitle(tags.get(which).name)
                         .setItems(new String[]{"编辑", "删除"}, (actionDialog, action) -> {
                             if (action == 0) editTag(which);
                             else removeTag(which);
@@ -812,12 +861,12 @@ public final class MainActivity extends Activity {
         path.setFocusable(false);
         Button choosePath = button("选择目录");
         LinearLayout pathRow = row();
-        pathRow.addView(path, new LinearLayout.LayoutParams(0, -2, 1));
+        pathRow.addView(labelled("目标目录", path), new LinearLayout.LayoutParams(0, -2, 1));
         pathRow.addView(choosePath);
-        form.addView(name);
+        form.addView(labelled("Tag 名称", name));
         form.addView(pathRow);
         choosePath.setOnClickListener(view -> pickDirectory(path.getText().toString(), path::setText));
-        new AlertDialog.Builder(this).setTitle("编辑 tag").setView(form)
+        new MaterialAlertDialogBuilder(this).setTitle("编辑 tag").setView(form)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialog, which) -> {
                     String newName = name.getText().toString().trim();
@@ -849,7 +898,7 @@ public final class MainActivity extends Activity {
     private void removeTag(int index) {
         if (index < 0 || index >= tags.size()) return;
         String name = tags.get(index).name;
-        new AlertDialog.Builder(this).setTitle("删除 tag")
+        new MaterialAlertDialogBuilder(this).setTitle("删除 tag")
                 .setMessage("删除后当前会话中已选择该 tag 的文件也会取消选择。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("删除", (dialog, which) -> {
@@ -869,7 +918,7 @@ public final class MainActivity extends Activity {
             tagList.addView(text("请先新增 tag，并为 tag 填写目标目录。", 0xff667085));
         }
         for (Models.TagMapping tag : tags) {
-            CheckBox check = new CheckBox(this);
+            CheckBox check = new MaterialCheckBox(this);
             check.setText(tag.name + "\n" + tag.targetPath);
             check.setTag(tag.name);
             Models.FileItem item = currentIndex >= 0 && currentIndex < files.size() ? files.get(currentIndex) : null;
@@ -921,7 +970,7 @@ public final class MainActivity extends Activity {
         String message = "将顺序处理 " + pending.size() + " 个文件。";
         if (multi) message += "多 tag 文件会复制到多个目标目录。";
         if (converted > 0) message += "图片会转 WebP，全部上传成功后删除源文件。";
-        new AlertDialog.Builder(this).setTitle("确认保存").setMessage(message)
+        new MaterialAlertDialogBuilder(this).setTitle("确认保存").setMessage(message)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialog, which) -> submitNext(pending, 0)).show();
     }
@@ -1106,7 +1155,7 @@ public final class MainActivity extends Activity {
             showError("当前文件不是可转换的图片");
             return;
         }
-        new AlertDialog.Builder(this).setTitle("仅转换当前图片")
+        new MaterialAlertDialogBuilder(this).setTitle("仅转换当前图片")
                 .setMessage("转 WebP 上传回原目录，成功后删除原文件。继续吗？")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("转换", (dialog, which) -> {
@@ -1138,12 +1187,12 @@ public final class MainActivity extends Activity {
             return;
         }
         final int deleteIndex = currentIndex;
-        new AlertDialog.Builder(this).setTitle("确认删除远程文件")
+        new MaterialAlertDialogBuilder(this).setTitle("确认删除远程文件")
                 .setMessage("此操作会直接删除远程文件，无法撤销。\n\n文件: "
                         + item.entry.name + "\n路径: " + item.entry.path)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("删除", (dialog, which) ->
-                        new AlertDialog.Builder(this).setTitle("最终确认删除")
+                        new MaterialAlertDialogBuilder(this).setTitle("最终确认删除")
                                 .setMessage("确认后将立即向 OpenList 提交删除请求。\n\n" + item.entry.path)
                                 .setNegativeButton("取消", null)
                                 .setPositiveButton("确认删除", (finalDialog, finalWhich) -> {
@@ -1174,7 +1223,7 @@ public final class MainActivity extends Activity {
 
     private void showMoreActions() {
         String[] actions = {"连接信息", "清空全部未提交选择", "清理预览缓存", "关于"};
-        new AlertDialog.Builder(this).setTitle("更多操作").setItems(actions, (dialog, which) -> {
+        new MaterialAlertDialogBuilder(this).setTitle("更多操作").setItems(actions, (dialog, which) -> {
             if (which == 0) {
                 showConnectionDiagnostics();
             } else if (which == 1) {
@@ -1214,7 +1263,7 @@ public final class MainActivity extends Activity {
             return;
         }
         final int pending = count;
-        new AlertDialog.Builder(this).setTitle("清空全部未提交选择")
+        new MaterialAlertDialogBuilder(this).setTitle("清空全部未提交选择")
                 .setMessage("将清空 " + pending + " 个文件的本地 tag 选择，不会修改远程文件。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("清空", (dialog, which) -> {
@@ -1236,7 +1285,7 @@ public final class MainActivity extends Activity {
             showError("当前有任务正在进行，请等待完成");
             return;
         }
-        new AlertDialog.Builder(this).setTitle("确认注销")
+        new MaterialAlertDialogBuilder(this).setTitle("确认注销")
                 .setMessage("将断开连接并关闭自动登录，已保存的连接信息会保留。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("注销", (dialog, which) -> {
@@ -1349,7 +1398,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showInfo(String title, String message) {
-        new AlertDialog.Builder(this).setTitle(title).setMessage(message).setPositiveButton("确定", null).show();
+        new MaterialAlertDialogBuilder(this).setTitle(title).setMessage(message).setPositiveButton("确定", null).show();
     }
 
     private LinearLayout baseRoot() {
@@ -1359,12 +1408,13 @@ public final class MainActivity extends Activity {
         return value;
     }
 
-    private LinearLayout panel() {
-        LinearLayout value = new LinearLayout(this);
-        value.setOrientation(LinearLayout.VERTICAL);
-        value.setPadding(dp(14), dp(12), dp(14), dp(12));
-        value.setBackgroundResource(R.drawable.panel_background);
-        value.setElevation(dp(1));
+    private MaterialPanel panel() {
+        MaterialPanel value = new MaterialPanel(this);
+        value.setCardBackgroundColor(Color.WHITE);
+        value.setCardElevation(dp(1));
+        value.setRadius(dp(8));
+        value.setStrokeWidth(dp(1));
+        value.setStrokeColor(0xffdfe3eb);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         params.setMargins(0, dp(8), 0, dp(8));
         value.setLayoutParams(params);
@@ -1397,54 +1447,83 @@ public final class MainActivity extends Activity {
     }
 
     private EditText input(String hint) {
-        EditText result = new EditText(this);
+        TextInputEditText result = new TextInputEditText(this);
         result.setHint(hint);
         result.setSingleLine(true);
         result.setTextSize(15);
-        result.setTextColor(0xff172033);
-        result.setHintTextColor(0xff98A2B3);
-        result.setBackgroundResource(R.drawable.input_background);
-        result.setPadding(dp(10), 0, dp(10), 0);
         return result;
     }
 
-    private LinearLayout labelled(String label, View child) {
-        LinearLayout value = new LinearLayout(this);
-        value.setOrientation(LinearLayout.VERTICAL);
-        TextView labelView = text(label, 0xff667085);
+    private TextInputLayout labelled(String label, View child) {
+        TextInputLayout value = new TextInputLayout(this);
+        value.setHint(label);
+        value.setBoxBackgroundMode(TextInputLayout.BOX_BACKGROUND_OUTLINE);
+        value.setBoxCornerRadii(dp(8), dp(8), dp(8), dp(8));
         if (child.getId() == View.NO_ID) child.setId(View.generateViewId());
-        labelView.setLabelFor(child.getId());
-        value.addView(labelView);
-        value.addView(child, new LinearLayout.LayoutParams(-1, -2));
+        value.addView(child, new ViewGroup.LayoutParams(-1, -2));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(0, dp(4), 0, dp(4));
+        value.setLayoutParams(params);
         return value;
     }
 
     private Button button(String label) {
-        Button result = new Button(this);
+        MaterialButton result = new MaterialButton(this, null,
+                com.google.android.material.R.attr.materialButtonOutlinedStyle);
         result.setText(label);
         result.setAllCaps(false);
         result.setTextSize(14);
-        result.setTextColor(0xff172033);
         result.setMinHeight(dp(44));
         result.setMinimumHeight(dp(44));
-        result.setPadding(dp(8), 0, dp(8), 0);
-        result.setBackgroundResource(R.drawable.secondary_button_background);
+        result.setInsetTop(0);
+        result.setInsetBottom(0);
         return result;
     }
 
     private Button primaryButton(String label) {
-        Button result = button(label);
-        result.setTextColor(Color.WHITE);
+        MaterialButton result = new MaterialButton(this);
+        result.setText(label);
+        result.setAllCaps(false);
+        result.setTextSize(14);
+        result.setMinHeight(dp(44));
+        result.setMinimumHeight(dp(44));
+        result.setInsetTop(0);
+        result.setInsetBottom(0);
         result.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        result.setBackgroundResource(R.drawable.primary_button_background);
         return result;
     }
 
     private RadioButton radio(String label) {
-        RadioButton result = new RadioButton(this);
+        MaterialRadioButton result = new MaterialRadioButton(this);
         result.setText(label);
         result.setAllCaps(false);
         return result;
+    }
+
+    private static final class MaterialPanel extends MaterialCardView {
+        private final LinearLayout content;
+
+        MaterialPanel(Context context) {
+            super(context);
+            content = new LinearLayout(context);
+            content.setOrientation(LinearLayout.VERTICAL);
+            content.setPadding(dp(context, 14), dp(context, 12), dp(context, 14), dp(context, 12));
+            super.addView(content, new ViewGroup.LayoutParams(-1, -2));
+        }
+
+        @Override
+        public void addView(View child) {
+            content.addView(child);
+        }
+
+        @Override
+        public void addView(View child, ViewGroup.LayoutParams params) {
+            content.addView(child, params);
+        }
+
+        private static int dp(Context context, int value) {
+            return Math.round(value * context.getResources().getDisplayMetrics().density);
+        }
     }
 
     private int dp(int value) {

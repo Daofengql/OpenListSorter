@@ -405,7 +405,7 @@ public final class OpenListClient {
         return result;
     }
 
-    private static byte[] readAll(InputStream input, long total, ProgressCallback progressCallback) throws IOException {
+    private byte[] readAll(InputStream input, long total, ProgressCallback progressCallback) throws IOException {
         try (InputStream stream = input; ByteArrayOutputStream output = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[16384];
             long received = 0;
@@ -416,7 +416,7 @@ public final class OpenListClient {
                 }
                 output.write(buffer, 0, count);
                 received += count;
-                if (progressCallback != null) {
+                if (!closed && progressCallback != null) {
                     progressCallback.onProgress(received, total);
                 }
             }

@@ -8,9 +8,9 @@ import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 
-import android.widget.ImageView;
+import androidx.appcompat.widget.AppCompatImageView;
 
-public final class ZoomImageView extends ImageView {
+public final class ZoomImageView extends AppCompatImageView {
     private final Matrix imageMatrixValue = new Matrix();
     private final ScaleGestureDetector scaleDetector;
     private final GestureDetector gestureDetector;
