@@ -3,6 +3,7 @@ package com.openlistsorter.app.data;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.util.LruCache;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -12,17 +13,60 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Comparator;
 
 import static com.openlistsorter.app.data.Models.RemoteEntry;
 
+/** A bounded disk cache with a small decoded-image memory tier. */
 public final class PreviewCache {
+    public static final long DEFAULT_MAX_DISK_BYTES = 256L * 1024L * 1024L;
+    // Keep the decoded tier small. A single 2048px ARGB bitmap is already about 16 MiB;
+    // retaining several of them while an Activity is changing can otherwise trigger process
+    // eviction on phones with a modest graphics heap.
+    public static final int DEFAULT_MAX_MEMORY_BYTES = 8 * 1024 * 1024;
+
+    public static final class Stats {
+        public final int fileCount;
+        public final long totalBytes;
+        public final int memoryEntryCount;
+        public final int memoryBytes;
+
+        Stats(int fileCount, long totalBytes, int memoryEntryCount, int memoryBytes) {
+            this.fileCount = fileCount;
+            this.totalBytes = totalBytes;
+            this.memoryEntryCount = memoryEntryCount;
+            this.memoryBytes = memoryBytes;
+        }
+    }
+
     private final File directory;
+    private final long maxDiskBytes;
+    private final Object diskLock = new Object();
+    private final Object memoryLock = new Object();
+    private long diskGeneration;
+    private final int maxMemoryBytes;
+    private final LruCache<String, Bitmap> imageMemoryCache;
 
     public PreviewCache(Context context) {
-        directory = new File(context.getCacheDir(), "previews");
-        if (!directory.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            directory.mkdirs();
+        this(new File(context.getCacheDir(), "previews"), DEFAULT_MAX_DISK_BYTES,
+                DEFAULT_MAX_MEMORY_BYTES);
+    }
+
+    PreviewCache(File directory, long maxDiskBytes, int maxMemoryBytes) {
+        this.directory = directory;
+        this.maxDiskBytes = Math.max(1L, maxDiskBytes);
+        this.maxMemoryBytes = Math.max(1, maxMemoryBytes);
+        this.imageMemoryCache = new LruCache<>(this.maxMemoryBytes) {
+            @Override
+            protected int sizeOf(String key, Bitmap value) {
+                return value == null ? 0 : value.getAllocationByteCount();
+            }
+        };
+        synchronized (diskLock) {
+            ensureDirectory();
+            removeTemporaryFiles();
+            trimToSizeLocked();
         }
     }
 
@@ -42,95 +86,259 @@ public final class PreviewCache {
         return write(fileFor(entry, "decoded-jpeg", ".jpg"), data);
     }
 
-    public Bitmap loadImage(RemoteEntry entry) {
-        byte[] data = loadDecodedJpeg(entry);
-        return data == null ? null : BitmapFactory.decodeByteArray(data, 0, data.length);
+    public boolean hasRawData(RemoteEntry entry) {
+        return isCachedFile(fileFor(entry, "raw", ".bin"));
     }
 
+    public boolean hasImage(RemoteEntry entry) {
+        return memoryGet(cacheKey(entry, "preview-bitmap")) != null
+                || isCachedFile(fileFor(entry, "decoded-jpeg", ".jpg"));
+    }
+
+    public boolean putImageInMemory(RemoteEntry entry, Bitmap image) {
+        return image != null && !image.isRecycled()
+                && memoryPut(cacheKey(entry, "preview-bitmap"), image);
+    }
+
+    public Bitmap loadImage(RemoteEntry entry) {
+        return loadImage(entry, 2048, 2048);
+    }
+
+    public Bitmap loadImage(RemoteEntry entry, int maxWidth, int maxHeight) {
+        return loadImage(entry, maxWidth, maxHeight, true);
+    }
+
+    public Bitmap loadImage(RemoteEntry entry, int maxWidth, int maxHeight,
+                            boolean cacheDecodedImage) {
+        String memoryKey = cacheKey(entry, "preview-bitmap");
+        Bitmap memory = memoryGet(memoryKey);
+        if (memory != null && !memory.isRecycled()) {
+            return memory;
+        }
+        byte[] data = loadDecodedJpeg(entry);
+        Bitmap decoded = data == null ? null : ImageConverter.decodePreview(data,
+                Math.max(1, maxWidth), Math.max(1, maxHeight));
+        if (decoded != null && cacheDecodedImage) {
+            memoryPut(memoryKey, decoded);
+        }
+        return decoded;
+    }
+
+    /** Stores the full-quality JPEG used as the deterministic HEIF/AVIF conversion source. */
     public boolean storeImage(RemoteEntry entry, Bitmap image) {
-        if (image == null) {
+        byte[] encoded = encodeJpeg(image, 100);
+        if (encoded == null || !storeDecodedJpeg(entry, encoded)) {
             return false;
         }
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        if (!image.compress(Bitmap.CompressFormat.JPEG, 100, output)) {
-            return false;
-        }
-        return storeDecodedJpeg(entry, output.toByteArray());
+        memoryPut(cacheKey(entry, "preview-bitmap"), image);
+        return true;
     }
 
     public File rawFile(RemoteEntry entry) {
         return fileFor(entry, "raw", ".bin");
     }
 
+    public Stats stats() {
+        int memoryEntries;
+        int memoryBytes;
+        synchronized (memoryLock) {
+            memoryEntries = imageMemoryCache.snapshot().size();
+            memoryBytes = imageMemoryCache.size();
+        }
+        synchronized (diskLock) {
+            File[] files = directory.listFiles(File::isFile);
+            int count = 0;
+            long bytes = 0L;
+            if (files != null) {
+                for (File file : files) {
+                    if (file.getName().contains(".tmp-")) continue;
+                    count++;
+                    bytes += Math.max(0L, file.length());
+                }
+            }
+            return new Stats(count, bytes, memoryEntries, memoryBytes);
+        }
+    }
+
     public void clear() {
-        deleteRecursively(directory);
-        //noinspection ResultOfMethodCallIgnored
-        directory.mkdirs();
+        clearMemory();
+        synchronized (diskLock) {
+            diskGeneration++;
+            deleteRecursively(directory);
+            ensureDirectory();
+        }
+    }
+
+    /** Drops decoded bitmap references without touching the reusable on-disk cache. */
+    public void clearMemory() {
+        synchronized (memoryLock) {
+            imageMemoryCache.evictAll();
+        }
+    }
+
+    /**
+     * Releases decoded bitmap storage after every ImageView using this cache has detached its
+     * drawable. Callers must not use this while a cached bitmap can still be rendered.
+     */
+    public void clearMemoryAndRecycle() {
+        ArrayList<Bitmap> bitmaps;
+        synchronized (memoryLock) {
+            bitmaps = new ArrayList<>(imageMemoryCache.snapshot().values());
+            imageMemoryCache.evictAll();
+        }
+        for (Bitmap bitmap : bitmaps) {
+            if (bitmap != null && !bitmap.isRecycled()) {
+                try {
+                    bitmap.recycle();
+                } catch (RuntimeException ignored) {
+                }
+            }
+        }
     }
 
     public String directoryPath() {
         return directory.getAbsolutePath();
     }
 
+    private Bitmap memoryGet(String key) {
+        synchronized (memoryLock) {
+            return imageMemoryCache.get(key);
+        }
+    }
+
+    private boolean memoryPut(String key, Bitmap image) {
+        if (image == null || image.isRecycled()
+                || image.getAllocationByteCount() > maxMemoryBytes) {
+            return false;
+        }
+        synchronized (memoryLock) {
+            imageMemoryCache.put(key, image);
+            return imageMemoryCache.get(key) == image;
+        }
+    }
+
     private File fileFor(RemoteEntry entry, String variant, String extension) {
-        String material = "preview-android-v1\n" + variant + "\n" + entry.path + "\n"
+        return new File(directory, cacheKey(entry, variant) + extension);
+    }
+
+    private static String cacheKey(RemoteEntry entry, String variant) {
+        String material = "preview-android-v2\n" + variant + "\n" + entry.path + "\n"
                 + entry.size + "\n" + entry.modified + "\n" + entry.name;
-        return new File(directory, sha256(material.getBytes(StandardCharsets.UTF_8)) + extension);
+        return sha256(material.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static byte[] read(File file) {
-        if (file == null || !file.isFile()) {
-            return null;
-        }
-        try (FileInputStream input = new FileInputStream(file)) {
-            ByteArrayOutputStream output = new ByteArrayOutputStream();
-            byte[] buffer = new byte[8192];
-            int count;
-            while ((count = input.read(buffer)) >= 0) {
-                if (count > 0) {
-                    output.write(buffer, 0, count);
+    private byte[] read(File file) {
+        synchronized (diskLock) {
+            if (file == null || !file.isFile()) {
+                return null;
+            }
+            try (FileInputStream input = new FileInputStream(file);
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[16384];
+                int count;
+                while ((count = input.read(buffer)) >= 0) {
+                    if (count > 0) output.write(buffer, 0, count);
                 }
+                byte[] result = output.toByteArray();
+                if (result.length == 0) return null;
+                //noinspection ResultOfMethodCallIgnored
+                file.setLastModified(System.currentTimeMillis());
+                return result;
+            } catch (IOException error) {
+                return null;
             }
-            byte[] result = output.toByteArray();
-            return result.length == 0 ? null : result;
-        } catch (IOException error) {
-            return null;
         }
     }
 
-    private static boolean write(File file, byte[] data) {
-        if (file == null || data == null || data.length == 0) {
+    private boolean isCachedFile(File file) {
+        synchronized (diskLock) {
+            return file != null && file.isFile() && file.length() > 0L;
+        }
+    }
+
+    private boolean write(File file, byte[] data) {
+        if (file == null || data == null || data.length == 0 || data.length > maxDiskBytes) {
             return false;
         }
-        File parent = file.getParentFile();
-        if (parent == null || (!parent.exists() && !parent.mkdirs())) {
-            return false;
+        final long generation;
+        synchronized (diskLock) {
+            if (!ensureDirectory()) return false;
+            generation = diskGeneration;
         }
-        File temp = new File(parent, file.getName() + ".tmp");
-        try (FileOutputStream output = new FileOutputStream(temp)) {
-            output.write(data);
-            output.flush();
-            if (file.exists() && !file.delete()) {
-                return false;
+        File temp = new File(directory, file.getName() + ".tmp-"
+                + Thread.currentThread().getId() + "-" + System.nanoTime());
+        try {
+            // Close the temporary file before replacing the cache entry. Windows keeps an open
+            // FileOutputStream exclusively locked, so renaming it inside this block fails.
+            try (FileOutputStream output = new FileOutputStream(temp)) {
+                output.write(data);
+                output.flush();
             }
-            return temp.renameTo(file);
+            synchronized (diskLock) {
+                if (generation != diskGeneration || !ensureDirectory()) return false;
+                if (file.exists() && !file.delete()) return false;
+                if (!temp.renameTo(file)) return false;
+                //noinspection ResultOfMethodCallIgnored
+                file.setLastModified(System.currentTimeMillis());
+                trimToSizeLocked();
+                return file.isFile();
+            }
         } catch (IOException error) {
+            return false;
+        } finally {
             //noinspection ResultOfMethodCallIgnored
             temp.delete();
-            return false;
+        }
+    }
+
+    private boolean ensureDirectory() {
+        return directory.isDirectory() || directory.mkdirs();
+    }
+
+    private void removeTemporaryFiles() {
+        File[] files = directory.listFiles(file -> file.isFile() && file.getName().contains(".tmp-"));
+        if (files == null) return;
+        for (File file : files) {
+            //noinspection ResultOfMethodCallIgnored
+            file.delete();
+        }
+    }
+
+    private void trimToSizeLocked() {
+        File[] listed = directory.listFiles(file -> file.isFile() && !file.getName().contains(".tmp-"));
+        if (listed == null) return;
+        ArrayList<File> files = new ArrayList<>();
+        long total = 0L;
+        for (File file : listed) {
+            files.add(file);
+            total += Math.max(0L, file.length());
+        }
+        if (total <= maxDiskBytes) return;
+        files.sort(Comparator.comparingLong(File::lastModified));
+        for (File file : files) {
+            long length = Math.max(0L, file.length());
+            if (file.delete()) total -= length;
+            if (total <= maxDiskBytes) break;
+        }
+    }
+
+    private static byte[] encodeJpeg(Bitmap image, int quality) {
+        if (image == null || image.isRecycled()) return null;
+        try {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            return image.compress(Bitmap.CompressFormat.JPEG, quality, output) && output.size() > 0
+                    ? output.toByteArray() : null;
+        } catch (RuntimeException | OutOfMemoryError ignored) {
+            return null;
         }
     }
 
     private static void deleteRecursively(File file) {
-        if (file == null || !file.exists()) {
-            return;
-        }
+        if (file == null || !file.exists()) return;
         if (file.isDirectory()) {
             File[] children = file.listFiles();
             if (children != null) {
-                for (File child : children) {
-                    deleteRecursively(child);
-                }
+                for (File child : children) deleteRecursively(child);
             }
         }
         //noinspection ResultOfMethodCallIgnored
@@ -149,9 +357,7 @@ public final class PreviewCache {
         try {
             byte[] digest = MessageDigest.getInstance(algorithm).digest(data);
             StringBuilder result = new StringBuilder(digest.length * 2);
-            for (byte value : digest) {
-                result.append(String.format("%02x", value & 0xff));
-            }
+            for (byte value : digest) result.append(String.format("%02x", value & 0xff));
             return result.toString();
         } catch (NoSuchAlgorithmException error) {
             throw new IllegalStateException(error);

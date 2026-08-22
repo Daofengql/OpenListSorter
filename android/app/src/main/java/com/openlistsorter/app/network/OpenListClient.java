@@ -40,6 +40,7 @@ import javax.net.ssl.SSLException;
 
 public final class OpenListClient {
     private static final String TAG = "OpenListClient";
+    private static final int MAX_DIRECTORY_ENTRIES = 2000;
     public interface SimpleCallback {
         void onResult(boolean ok, String message);
     }
@@ -86,12 +87,22 @@ public final class OpenListClient {
     }
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService executor = Executors.newCachedThreadPool();
+    private final ExecutorService executor = Executors.newFixedThreadPool(6, runnable -> {
+        Thread thread = new Thread(runnable, "openlist-io");
+        thread.setPriority(Thread.NORM_PRIORITY - 1);
+        return thread;
+    });
+    private final ExecutorService preloadExecutor = Executors.newFixedThreadPool(4, runnable -> {
+        Thread thread = new Thread(runnable, "openlist-preload");
+        thread.setPriority(Thread.NORM_PRIORITY - 2);
+        return thread;
+    });
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
-            .callTimeout(20, TimeUnit.SECONDS)
+            // Preserve large transfers while preventing drip connections from occupying a worker forever.
+            .callTimeout(30, TimeUnit.MINUTES)
             .followRedirects(true)
             .followSslRedirects(true)
             .build();
@@ -254,7 +265,9 @@ public final class OpenListClient {
             payload.put("path", normalized);
             payload.put("password", "");
             payload.put("page", 1);
-            payload.put("per_page", 0);
+            // Do not ask the server for an unbounded directory response. Very large
+            // directories otherwise create a huge JSON object and a matching object graph.
+            payload.put("per_page", MAX_DIRECTORY_ENTRIES);
             payload.put("refresh", refresh);
         } catch (JSONException error) {
             post(callback, false, error.getMessage(), normalized, new ArrayList<>());
@@ -265,11 +278,15 @@ public final class OpenListClient {
             if (ok) {
                 JSONArray content = data.optJSONArray("content");
                 if (content != null) {
-                    for (int i = 0; i < content.length(); i++) {
+                    int limit = Math.min(content.length(), MAX_DIRECTORY_ENTRIES);
+                    for (int i = 0; i < limit; i++) {
                         JSONObject object = content.optJSONObject(i);
                         if (object != null) {
                             entries.add(Models.RemoteEntry.fromJson(object, normalized));
                         }
+                    }
+                    if (content.length() > MAX_DIRECTORY_ENTRIES) {
+                        message = message + "；目录过大，仅加载前 " + MAX_DIRECTORY_ENTRIES + " 项";
                     }
                 }
             }
@@ -299,12 +316,18 @@ public final class OpenListClient {
     }
 
     public void downloadUrl(URL url, DownloadCallback callback, ProgressCallback progressCallback) {
+        downloadUrl(url, callback, progressCallback, false);
+    }
+
+    public void downloadUrl(URL url, DownloadCallback callback, ProgressCallback progressCallback,
+                            boolean lowPriority) {
         if (url == null) {
             post(callback, false, "文件下载地址无效。", new byte[0]);
             return;
         }
         try {
-            executor.execute(() -> {
+            ExecutorService downloadExecutor = lowPriority ? preloadExecutor : executor;
+            downloadExecutor.execute(() -> {
                 try {
                     HttpResult result = requestAbsolute(url, progressCallback);
                     if (!result.error.isEmpty()) {
@@ -392,11 +415,25 @@ public final class OpenListClient {
     }
 
     public void shutdown() {
+        if (closed) {
+            return;
+        }
         closed = true;
         mainHandler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
+        preloadExecutor.shutdownNow();
         httpClient.dispatcher().cancelAll();
-        httpClient.connectionPool().evictAll();
+        // OkHttp may write a TLS close-notify while evicting an idle connection.
+        // That is a network operation and must not run from Activity.onDestroy().
+        Thread cleanupThread = new Thread(() -> {
+            try {
+                httpClient.connectionPool().evictAll();
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Unable to evict HTTP connections during shutdown", error);
+            }
+        }, "openlist-close");
+        cleanupThread.setDaemon(true);
+        cleanupThread.start();
     }
 
     private void moveOrCopy(String endpoint, String sourceDirectory, String fileName,
@@ -540,7 +577,7 @@ public final class OpenListClient {
 
     private byte[] readAll(InputStream input, long total, ProgressCallback progressCallback) throws IOException {
         try (InputStream stream = input; ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[16384];
+            byte[] buffer = new byte[65536];
             long received = 0;
             while (total < 0 || received < total) {
                 int requested = buffer.length;

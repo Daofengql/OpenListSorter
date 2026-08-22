@@ -7,13 +7,24 @@ import android.util.AttributeSet;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
+import android.view.VelocityTracker;
+import android.view.ViewConfiguration;
 
 import androidx.appcompat.widget.AppCompatImageView;
 
 public final class ZoomImageView extends AppCompatImageView {
+    public interface SwipeListener {
+        void onSwipeLeft();
+
+        void onSwipeRight();
+    }
+
     private final Matrix imageMatrixValue = new Matrix();
     private final ScaleGestureDetector scaleDetector;
     private final GestureDetector gestureDetector;
+    private VelocityTracker velocityTracker;
+    private final int minFlingVelocity;
+    private SwipeListener swipeListener;
     private float scale = 1f;
     private float fitScale = 1f;
     private float offsetX;
@@ -27,6 +38,7 @@ public final class ZoomImageView extends AppCompatImageView {
         super(context, attrs);
         setScaleType(ScaleType.MATRIX);
         setBackgroundColor(0xfff8fafc);
+        minFlingVelocity = ViewConfiguration.get(context).getScaledMinimumFlingVelocity();
         scaleDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
@@ -66,14 +78,39 @@ public final class ZoomImageView extends AppCompatImageView {
         if (getParent() != null && (event.getPointerCount() > 1 || scale > 1f)) {
             getParent().requestDisallowInterceptTouchEvent(true);
         }
+        if (velocityTracker == null) velocityTracker = VelocityTracker.obtain();
+        velocityTracker.addMovement(event);
         boolean scaled = scaleDetector.onTouchEvent(event);
         boolean gestured = gestureDetector.onTouchEvent(event);
         if (event.getActionMasked() == MotionEvent.ACTION_UP
                 || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP && swipeListener != null && scale <= 1.001f) {
+                velocityTracker.computeCurrentVelocity(1000, 8000f);
+                float vx = velocityTracker.getXVelocity();
+                float vy = velocityTracker.getYVelocity();
+                if (Math.abs(vx) > minFlingVelocity && Math.abs(vx) > Math.abs(vy)) {
+                    if (vx < 0) swipeListener.onSwipeLeft(); else swipeListener.onSwipeRight();
+                }
+            }
+            velocityTracker.recycle();
+            velocityTracker = null;
             if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(false);
             if (!scaled) performClick();
         }
         return scaled || gestured || super.onTouchEvent(event);
+    }
+
+    public void setSwipeListener(SwipeListener listener) {
+        swipeListener = listener;
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        if (velocityTracker != null) {
+            velocityTracker.recycle();
+            velocityTracker = null;
+        }
+        super.onDetachedFromWindow();
     }
 
     @Override

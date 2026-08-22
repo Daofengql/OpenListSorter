@@ -1,5 +1,8 @@
 package com.openlistsorter.app.data;
 
+import android.os.Parcel;
+import android.os.Parcelable;
+
 import org.json.JSONObject;
 
 import java.text.DecimalFormat;
@@ -174,5 +177,97 @@ public final class Models {
         }
         String suffix = lowerSuffix(entry.name);
         return suffix.isEmpty() ? "未知文件" : suffix.toUpperCase(Locale.US) + " 文件";
+    }
+
+    /** 轻量可序列化视图项，用于在全屏预览页之间传递远程文件信息。 */
+    public static final class PreviewItem implements Parcelable {
+        public final String name;
+        public final String path;
+        public final long size;
+        public final String modified;
+        public String rawUrl;
+        public final boolean isVideo;
+        public final ArrayList<String> selectedTags;
+        public boolean tagsEditable = true;
+        public boolean removed;
+
+        public PreviewItem(RemoteEntry entry) {
+            this.name = entry.name;
+            this.path = entry.path;
+            this.size = entry.size;
+            this.modified = entry.modified;
+            this.rawUrl = entry.rawUrl;
+            this.isVideo = isVideoFileName(entry.name);
+            this.selectedTags = new ArrayList<>();
+        }
+
+        protected PreviewItem(Parcel in) {
+            this(in, true);
+        }
+
+        private PreviewItem(Parcel in, boolean readRemoved) {
+            name = in.readString();
+            path = in.readString();
+            size = in.readLong();
+            modified = in.readString();
+            rawUrl = in.readString();
+            isVideo = in.readByte() != 0;
+            ArrayList<String> tags = in.createStringArrayList();
+            selectedTags = tags == null ? new ArrayList<>() : tags;
+            tagsEditable = in.readByte() != 0;
+            removed = readRemoved && in.readByte() != 0;
+        }
+
+        @Override
+        public void writeToParcel(Parcel dest, int flags) {
+            dest.writeString(name);
+            dest.writeString(path);
+            dest.writeLong(size);
+            dest.writeString(modified);
+            dest.writeString(rawUrl);
+            dest.writeByte((byte) (isVideo ? 1 : 0));
+            dest.writeStringList(selectedTags);
+            dest.writeByte((byte) (tagsEditable ? 1 : 0));
+            dest.writeByte((byte) (removed ? 1 : 0));
+        }
+
+        @Override
+        public int describeContents() {
+            return 0;
+        }
+
+        public static final Creator<PreviewItem> CREATOR = new Creator<PreviewItem>() {
+            @Override
+            public PreviewItem createFromParcel(Parcel source) {
+                return new PreviewItem(source);
+            }
+
+            @Override
+            public PreviewItem[] newArray(int size) {
+                return new PreviewItem[size];
+            }
+        };
+
+        public static final Creator<PreviewItem> LEGACY_CREATOR = new Creator<PreviewItem>() {
+            @Override
+            public PreviewItem createFromParcel(Parcel source) {
+                return new PreviewItem(source, false);
+            }
+
+            @Override
+            public PreviewItem[] newArray(int size) {
+                return new PreviewItem[size];
+            }
+        };
+
+        public RemoteEntry toEntry() {
+            RemoteEntry entry = new RemoteEntry();
+            entry.name = name;
+            entry.path = path;
+            entry.size = size;
+            entry.modified = modified;
+            entry.rawUrl = rawUrl;
+            return entry;
+        }
     }
 }

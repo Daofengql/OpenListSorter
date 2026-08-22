@@ -1,8 +1,11 @@
 package com.openlistsorter.app;
 
+import android.app.ActivityManager;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -14,11 +17,15 @@ import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.ImageButton;
 import android.widget.LinearLayout;
+import android.widget.NumberPicker;
 import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
@@ -27,9 +34,14 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.app.AlertDialog;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.card.MaterialCardView;
@@ -47,18 +59,53 @@ import com.openlistsorter.app.data.ImageConverter;
 import com.openlistsorter.app.data.Models;
 import com.openlistsorter.app.data.PreviewCache;
 import com.openlistsorter.app.network.OpenListClient;
+import com.openlistsorter.app.ui.PreviewActivity;
+import com.openlistsorter.app.ui.PreviewSessionStore;
 import com.openlistsorter.app.ui.RemoteDirectoryDialog;
-import com.openlistsorter.app.ui.ZoomImageView;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 public final class MainActivity extends AppCompatActivity {
     private static final int PAGE_SIZE = 20;
+    private static final int MAX_PREVIEW_ITEMS = 200;
+    private static final int MAX_PRELOAD_ITEMS = 2;
+    private static final long MAX_PRELOAD_BYTES = 32L * 1024L * 1024L;
+    private static final int DEFAULT_PRELOAD_CONCURRENCY = 3;
+    private static final int DEFAULT_SUBMIT_CONCURRENCY = 2;
+    private static final int MAIN_PREVIEW_DECODE_LIMIT = 1024;
+    private static final long FULLSCREEN_RETURN_RENDER_DELAY_MS = 900L;
+    private static final long DETACHED_BITMAP_RECYCLE_DELAY_MS = 500L;
     private static final int REQUEST_CREATE_DOCUMENT = 1001;
+    private static final int REQUEST_PREVIEW = 1002;
+    private static final String STATE_MAIN_SCREEN = "main_screen_visible";
+    private static final String STATE_ENDPOINT = "connection_endpoint";
+    private static final String STATE_AUTH_MODE = "connection_auth_mode";
+    private static final String STATE_TOKEN = "connection_token";
+    private static final String STATE_USERNAME = "connection_username";
+    private static final String STATE_PASSWORD = "connection_password";
+    private static final String STATE_PREVIEW_SESSION = "preview_session_id";
+    private static final Object FULL_RESOLUTION_CONVERSION_LOCK = new Object();
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private ExecutorService imageExecutor;
+    private ExecutorService cacheExecutor;
+    private int imageWorkerCount = 1;
+    private interface ImageDecodeCallback {
+        void onResult(Bitmap image, boolean cached);
+    }
+
+    private final HashMap<String, ArrayList<OpenListClient.DownloadCallback>> inFlightDownloads =
+            new HashMap<>();
+    private final HashMap<String, ArrayList<ImageDecodeCallback>> inFlightImageDecodes =
+            new HashMap<>();
+    private final HashMap<String, ArrayDeque<Runnable>> convertedUploadQueues = new HashMap<>();
     private Runnable delayedAutoLogin;
     private Runnable connectionTimeout;
     private int connectionGeneration;
@@ -83,20 +130,37 @@ public final class MainActivity extends AppCompatActivity {
     private int passwordModeButtonId;
     private byte[] pendingDownloadData;
     private String pendingDownloadName;
+    private boolean mainScreenVisible;
+    private String activePreviewSessionId;
+    private boolean previewActive;
+    private boolean suppressPreviewRender;
+    private Runnable delayedPreviewRender;
 
     private String sourcePath = "/";
     private final ArrayList<Models.FileItem> files = new ArrayList<>();
     private final ArrayList<Models.TagMapping> tags = new ArrayList<>();
     private int currentIndex = -1;
     private int currentPage;
-    private boolean classificationMode;
+    private volatile boolean classificationMode;
     private boolean busy;
     private boolean overwrite;
     private boolean convertOnSave;
-    private int preloadGeneration;
+    private volatile int preloadGeneration;
+    private volatile int cacheGeneration;
+    private int preloadConcurrency = DEFAULT_PRELOAD_CONCURRENCY;
+    private final ArrayDeque<Integer> preloadQueue = new ArrayDeque<>();
+    private int preloadActiveCount;
+    private int preloadCompletedCount;
+    private int preloadTotalCount;
+    private int submitConcurrency = DEFAULT_SUBMIT_CONCURRENCY;
+    private ArrayList<Integer> submitQueue = new ArrayList<>();
+    private int submitQueuePosition;
+    private int submitActiveCount;
+    private int submitCompletedCount;
+    private long lastProgressUiUpdate;
 
     private TextView sourcePathView;
-    private Button sourceBrowseButton;
+    private TextView visiblePathView;
     private Button downloadCurrentButton;
     private Button convertCurrentButton;
     private Button deleteCurrentButton;
@@ -104,30 +168,123 @@ public final class MainActivity extends AppCompatActivity {
     private TextView pageInfo;
     private Button previousPageButton;
     private Button nextPageButton;
-    private LinearLayout fileList;
+    private RecyclerView fileList;
+    private FileListAdapter fileAdapter;
     private TextView previewTitle;
     private TextView previewInfo;
     private Button previousFileButton;
     private Button nextFileButton;
-    private ZoomImageView imageView;
+    private ImageView imageView;
     private ImageView videoPlaceholder;
     private LinearLayout tagList;
     private Button enterButton;
     private Button saveButton;
+    private ImageButton tagEditButton;
+    private boolean tagEditMode;
     private CheckBox overwriteCheck;
     private CheckBox convertCheck;
+    private LinearLayout taskBand;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        // The connection form is easier to complete in portrait. Once authentication
+        // succeeds, start the work area in the requested landscape orientation.
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        configureFullscreenWindow();
+        ActivityManager activityManager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        int memoryClassMb = activityManager == null ? 256 : activityManager.getMemoryClass();
+        imageWorkerCount = memoryClassMb >= 512 ? 2 : 1;
+        imageExecutor = Executors.newFixedThreadPool(imageWorkerCount, runnable -> {
+            Thread thread = new Thread(runnable, "image-pipeline");
+            thread.setPriority(Thread.NORM_PRIORITY - 1);
+            return thread;
+        });
+        cacheExecutor = Executors.newFixedThreadPool(2, runnable -> {
+            Thread thread = new Thread(runnable, "cache-io");
+            thread.setPriority(Thread.NORM_PRIORITY - 2);
+            return thread;
+        });
         client = new OpenListClient();
         previewCache = new PreviewCache(this);
+        PreviewSessionStore.initialize(this);
         profile = ConnectionStore.load(this);
-        showConnectionScreen();
-        if (profile.autoLogin && profile.hasCredentials()) {
+        boolean restoreMainScreen = state != null && state.getBoolean(STATE_MAIN_SCREEN, false);
+        if (state != null) activePreviewSessionId = state.getString(STATE_PREVIEW_SESSION);
+        if (restoreMainScreen) {
+            restoreConnectionState(state);
+            mainScreenVisible = true;
+            client.setBaseUrl(profile.endpoint);
+            client.setToken(profile.token);
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+            showMainScreen();
+        } else {
+            showConnectionScreen();
+        }
+        if (!restoreMainScreen && profile.autoLogin && profile.hasCredentials()) {
             delayedAutoLogin = this::startConnection;
             mainHandler.postDelayed(delayedAutoLogin, 180);
         }
+    }
+
+    private void restoreConnectionState(Bundle state) {
+        if (state == null) return;
+        profile.endpoint = state.getString(STATE_ENDPOINT, profile.endpoint);
+        profile.token = state.getString(STATE_TOKEN, profile.token);
+        profile.username = state.getString(STATE_USERNAME, profile.username);
+        profile.password = state.getString(STATE_PASSWORD, profile.password);
+        String authMode = state.getString(STATE_AUTH_MODE, "token");
+        profile.authMode = "password".equals(authMode)
+                ? ConnectionProfile.AuthMode.PASSWORD : ConnectionProfile.AuthMode.TOKEN;
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        outState.putBoolean(STATE_MAIN_SCREEN, mainScreenVisible);
+        if (profile != null && mainScreenVisible) {
+            outState.putString(STATE_ENDPOINT, profile.endpoint);
+            outState.putString(STATE_AUTH_MODE,
+                    profile.authMode == ConnectionProfile.AuthMode.PASSWORD ? "password" : "token");
+            outState.putString(STATE_TOKEN, profile.token);
+            outState.putString(STATE_USERNAME, profile.username);
+            outState.putString(STATE_PASSWORD, profile.password);
+        }
+        if (activePreviewSessionId != null) {
+            outState.putString(STATE_PREVIEW_SESSION, activePreviewSessionId);
+        }
+        super.onSaveInstanceState(outState);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) hideStatusBar();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (mainScreenVisible) {
+            showMainScreen();
+        } else {
+            showConnectionScreen();
+        }
+    }
+
+    private void configureFullscreenWindow() {
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+        WindowInsetsControllerCompat controller = WindowCompat.getInsetsController(
+                getWindow(), getWindow().getDecorView());
+        controller.setSystemBarsBehavior(
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        controller.hide(WindowInsetsCompat.Type.statusBars());
+    }
+
+    private void hideStatusBar() {
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView())
+                .hide(WindowInsetsCompat.Type.statusBars());
     }
 
     @Override
@@ -136,7 +293,13 @@ public final class MainActivity extends AppCompatActivity {
         ++connectionGeneration;
         delayedAutoLogin = null;
         connectionTimeout = null;
+        delayedPreviewRender = null;
         mainHandler.removeCallbacksAndMessages(null);
+        inFlightDownloads.clear();
+        inFlightImageDecodes.clear();
+        convertedUploadQueues.clear();
+        if (imageExecutor != null) imageExecutor.shutdownNow();
+        if (cacheExecutor != null) cacheExecutor.shutdownNow();
         client.shutdown();
         super.onDestroy();
     }
@@ -144,6 +307,36 @@ public final class MainActivity extends AppCompatActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_PREVIEW) {
+            previewActive = false;
+            schedulePreviewRenderAfterFullscreen();
+            boolean consumed = false;
+            if (resultCode == RESULT_OK && data != null) {
+                try {
+                    String sessionId = data.getStringExtra(PreviewActivity.EXTRA_SESSION_ID);
+                    PreviewSessionStore.Session session = PreviewSessionStore.peek(sessionId);
+                    if (session != null) {
+                        mergePreviewResult(session.items, session.currentPath());
+                        consumed = true;
+                    } else {
+                        ArrayList<Models.PreviewItem> updated = data.getParcelableArrayListExtra(
+                                PreviewActivity.EXTRA_RESULT_ITEMS);
+                        String selectedPath = data.getStringExtra(PreviewActivity.EXTRA_RESULT_PATH);
+                        if (updated != null) {
+                            mergePreviewResult(updated, selectedPath);
+                            consumed = true;
+                        }
+                    }
+                } catch (RuntimeException | OutOfMemoryError error) {
+                    // Returning from a large preview must never take down the activity. The
+                    // lightweight preview session remains available for the next render/reload.
+                    if (status != null) status.setText("全屏结果已保留，正在恢复列表");
+                }
+            }
+            if (consumed) PreviewSessionStore.discard(activePreviewSessionId);
+            activePreviewSessionId = null;
+            return;
+        }
         if (requestCode != REQUEST_CREATE_DOCUMENT) {
             return;
         }
@@ -152,38 +345,112 @@ public final class MainActivity extends AppCompatActivity {
         pendingDownloadData = null;
         pendingDownloadName = null;
         if (resultCode != RESULT_OK || data == null || data.getData() == null || bytes == null) {
+            if (status != null) status.setText("已取消保存");
             return;
         }
-        try (OutputStream output = getContentResolver().openOutputStream(data.getData(), "w")) {
-            if (output == null) {
-                showError("无法打开用户选择的保存位置。");
-                return;
+        Uri target = data.getData();
+        try {
+            cacheExecutor.execute(() -> {
+                String errorMessage = "";
+                try (OutputStream output = getContentResolver().openOutputStream(target, "w")) {
+                    if (output == null) {
+                        errorMessage = "无法打开用户选择的保存位置。";
+                    } else {
+                        output.write(bytes);
+                        output.flush();
+                    }
+                } catch (IOException error) {
+                    errorMessage = "下载保存失败: " + error.getMessage();
+                }
+                String finalError = errorMessage;
+                mainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    if (finalError.isEmpty()) showInfo("已下载: " + name);
+                    else showError(finalError);
+                });
+            });
+        } catch (RejectedExecutionException error) {
+            showError("后台写入任务已停止，请重新下载。");
+        }
+    }
+
+    private void mergePreviewResult(ArrayList<Models.PreviewItem> updated, String selectedPath) {
+        if (updated == null || updated.isEmpty()) return;
+        if (files.isEmpty()) {
+            for (Models.PreviewItem preview : updated) {
+                if (preview.removed) continue;
+                Models.FileItem restored = new Models.FileItem(preview.toEntry());
+                restored.submitted = !preview.tagsEditable;
+                files.add(restored);
             }
-            output.write(bytes);
-            output.flush();
-            showInfo("已下载: " + name);
-        } catch (IOException error) {
-            showError("下载保存失败: " + error.getMessage());
+            classificationMode = true;
+            updateClassificationButton();
+        }
+        HashMap<String, Models.PreviewItem> byPath = new HashMap<>();
+        for (Models.PreviewItem preview : updated) byPath.put(preview.path, preview);
+        for (int i = files.size() - 1; i >= 0; i--) {
+            Models.PreviewItem preview = byPath.get(files.get(i).entry.path);
+            if (preview != null && preview.removed) files.remove(i);
+        }
+        for (Models.FileItem item : files) {
+            Models.PreviewItem preview = byPath.get(item.entry.path);
+            if (preview == null || preview.removed || item.submitted) continue;
+            item.selectedTags.clear();
+            item.selectedTags.addAll(preview.selectedTags);
+            if (preview.rawUrl != null && !preview.rawUrl.isEmpty()) {
+                item.entry.rawUrl = preview.rawUrl;
+            }
+        }
+        // The process may have been reclaimed while the preview Activity was visible. In that
+        // case the result is still harmless, but the old view hierarchy is no longer available.
+        // Keep the result path in the session store and wait for the user to reload the folder
+        // instead of dereferencing stale/null views during onActivityResult.
+        if (!mainScreenVisible || previewTitle == null || previewInfo == null) return;
+        int selectedIndex = -1;
+        if (selectedPath != null && !selectedPath.isEmpty()) {
+            for (int i = 0; i < files.size(); i++) {
+                if (selectedPath.equals(files.get(i).entry.path)) {
+                    selectedIndex = i;
+                    break;
+                }
+            }
+        }
+        if (selectedIndex >= 0) {
+            setCurrentIndex(selectedIndex);
+        } else {
+            renderFileList();
+            refreshTags();
+            updateStats();
+            renderCurrentFile();
         }
     }
 
     private void showConnectionScreen() {
+        mainScreenVisible = false;
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         root = baseRoot();
-        root.setPadding(dp(16), dp(24), dp(16), dp(16));
         applySystemBarInsets(root);
-        MaterialPanel card = panel();
-        TextView title = heading("OpenList Sorter", 24);
+
+        LinearLayout appBar = topBand();
+        TextView title = heading("OpenList Sorter", 20);
         title.setTextColor(getColorCompat(R.color.primary));
-        card.addView(title);
-        TextView subtitle = text("远程文件分类工具 · 连接 OpenList/Alist 服务器", 0xff505a59);
-        card.addView(subtitle);
+        TextView subtitle = text("连接 OpenList / AList", 0xff505a59);
+        subtitle.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        LinearLayout brandRow = row();
+        brandRow.addView(title, new LinearLayout.LayoutParams(-2, -2));
+        brandRow.addView(subtitle, new LinearLayout.LayoutParams(0, -2, 1));
+        appBar.addView(brandRow);
+        applyCutoutInsets(appBar);
+        root.addView(appBar, new LinearLayout.LayoutParams(-1, -2));
+
+        MaterialPanel card = panel();
 
         endpointEdit = input("https://openlist.example.com");
         card.addView(labelled("服务器地址（Endpoint）", endpointEdit));
 
         authGroup = new RadioGroup(this);
         authGroup.setOrientation(RadioGroup.HORIZONTAL);
-        RadioButton tokenMode = radio("Token key");
+        RadioButton tokenMode = radio("访问令牌");
         RadioButton passwordMode = radio("账号密码");
         tokenMode.setId(View.generateViewId());
         passwordMode.setId(View.generateViewId());
@@ -193,10 +460,10 @@ public final class MainActivity extends AppCompatActivity {
         tokenMode.setChecked(true);
         card.addView(authGroup);
 
-        tokenEdit = input("OpenList token");
+        tokenEdit = input("访问令牌");
         tokenEdit.setInputType(android.text.InputType.TYPE_CLASS_TEXT
                 | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        card.addView(labelled("Token key", tokenEdit));
+        card.addView(labelled("访问令牌", tokenEdit));
         LinearLayout passwordFields = new LinearLayout(this);
         passwordFields.setOrientation(LinearLayout.VERTICAL);
         usernameEdit = input("用户名");
@@ -262,23 +529,20 @@ public final class MainActivity extends AppCompatActivity {
         if (profile.authMode == ConnectionProfile.AuthMode.PASSWORD) {
             passwordMode.setChecked(true);
         }
-        TextView hint = text("提示：地址需包含 http:// 或 https:// 前缀（如 http://192.168.1.5:5244）。"
-                + "如果 OpenList 在电脑上运行，请勿填写 localhost/127.0.0.1，而要填写电脑的局域网 IP。"
-                + "HTTPS 若使用自签名证书，需先将其安装到设备并信任。", 0xff707978);
-        hint.setTextSize(12);
-        card.addView(hint);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         LinearLayout wrapper = new LinearLayout(this);
         wrapper.setGravity(Gravity.CENTER_HORIZONTAL);
-        int screenWidth = getResources().getDisplayMetrics().widthPixels;
-        int cardWidth = Math.min(dp(420), screenWidth - dp(32));
-        wrapper.addView(card, new LinearLayout.LayoutParams(cardWidth, LinearLayout.LayoutParams.WRAP_CONTENT));
+        wrapper.setPadding(dp(16), dp(2), dp(16), dp(8));
+        wrapper.addView(card, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
         scroll.addView(wrapper, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
         root.addView(scroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
         setContentView(root);
+        ViewCompat.requestApplyInsets(root);
     }
 
     private void startConnection() {
@@ -293,7 +557,7 @@ public final class MainActivity extends AppCompatActivity {
             return;
         }
         if (!requested.hasCredentials()) {
-            showError("请输入 token key，或完整的用户名和密码");
+            showError("请输入访问令牌，或完整的用户名和密码");
             return;
         }
         final int attempt = ++connectionGeneration;
@@ -349,6 +613,8 @@ public final class MainActivity extends AppCompatActivity {
             } else {
                 ConnectionStore.clearRememberedConnection(this);
             }
+            mainScreenVisible = true;
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
             showMainScreen();
         };
         if (requested.authMode == ConnectionProfile.AuthMode.PASSWORD) {
@@ -401,143 +667,231 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void showMainScreen() {
+        mainScreenVisible = true;
         root = baseRoot();
+        applySystemBarInsets(root);
+
+        enterButton = iconButton(android.R.drawable.ic_media_play, "进入分类模式");
+        visiblePathView = text(sourcePath, getColorCompat(R.color.on_surface));
+        visiblePathView.setTextSize(14);
+        visiblePathView.setSingleLine(true);
+        visiblePathView.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        visiblePathView.setGravity(Gravity.CENTER_VERTICAL);
+        visiblePathView.setPadding(dp(4), 0, dp(4), dp(2));
+        visiblePathView.setClickable(true);
+        visiblePathView.setFocusable(true);
+        visiblePathView.setContentDescription("当前源目录，点击选择目录");
+
+        LinearLayout appBar = topBand();
+        LinearLayout titleRow = row();
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        status = text("", 0xff505a59);
+        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        status.setTextSize(11);
+        status.setSingleLine(true);
+        status.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        status.setVisibility(View.GONE);
+        status.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence value, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence value, int start, int before, int count) {
+                status.setVisibility(value == null || value.length() == 0 ? View.GONE : View.VISIBLE);
+            }
+            @Override public void afterTextChanged(android.text.Editable value) {}
+        });
+        LinearLayout pathBlock = new LinearLayout(this);
+        pathBlock.setOrientation(LinearLayout.VERTICAL);
+        TextView locationLabel = text("源目录", getColorCompat(R.color.on_surface_variant));
+        locationLabel.setTextSize(11);
+        locationLabel.setPadding(dp(4), dp(2), dp(4), 0);
+        pathBlock.addView(locationLabel, new LinearLayout.LayoutParams(-1, dp(18)));
+        pathBlock.addView(visiblePathView, new LinearLayout.LayoutParams(-1, dp(30)));
+        titleRow.addView(enterButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        titleRow.addView(pathBlock, new LinearLayout.LayoutParams(0, dp(48), 1));
+        Button more = iconButton(R.drawable.ic_more_vertical, "设置与更多操作");
+        LinearLayout.LayoutParams moreParams = new LinearLayout.LayoutParams(dp(48), dp(48));
+        moreParams.setMargins(0, 0, dp(8), 0);
+        saveButton = iconButton(android.R.drawable.ic_menu_upload, "提交已选分类");
+        titleRow.addView(saveButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        titleRow.addView(more, moreParams);
+        appBar.addView(titleRow);
+        appBar.addView(status, new LinearLayout.LayoutParams(-1, -2));
+        root.addView(appBar, new LinearLayout.LayoutParams(-1, -2));
+        more.setOnClickListener(view -> showMoreActions());
+
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(14), dp(10), dp(14), dp(12));
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(content);
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        content.setPadding(dp(16), dp(8), dp(16), dp(12));
+        root.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        LinearLayout titleRow = row();
-        TextView title = heading("OpenList Sorter", 22);
-        titleRow.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        Button more = button("更多");
-        Button logout = button("注销");
-        titleRow.addView(more);
-        titleRow.addView(logout);
-        content.addView(titleRow);
-        more.setOnClickListener(view -> showMoreActions());
-        logout.setOnClickListener(view -> logout());
-
-        status = text("已连接: " + client.getBaseUrl(), 0xff505a59);
-        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        content.addView(status);
         progress = new LinearProgressIndicator(this);
         progress.setContentDescription("当前操作进度");
         progress.setIndeterminate(true);
         progress.setVisibility(View.GONE);
-        content.addView(progress, new LinearLayout.LayoutParams(-1, dp(6)));
+        content.addView(progress, new LinearLayout.LayoutParams(-1, dp(4)));
 
-        MaterialPanel task = panel();
-        task.addView(heading("分类任务", 17));
+        taskBand = new LinearLayout(this);
+        taskBand.setOrientation(LinearLayout.VERTICAL);
+        taskBand.setBackgroundColor(getColorCompat(R.color.surface));
+        taskBand.setPadding(dp(12), dp(6), dp(12), dp(6));
+        boolean wideWorkspace = isWideWorkspace();
+        boolean portrait = getResources().getConfiguration().orientation
+                == Configuration.ORIENTATION_PORTRAIT;
+        LinearLayout sourceRow = row();
+        sourceRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView taskLabel = text("源目录", getColorCompat(R.color.on_surface_variant));
+        taskLabel.setTextSize(12);
+        taskLabel.setPadding(0, 0, dp(12), 0);
+        sourceRow.addView(taskLabel, new LinearLayout.LayoutParams(-2, -2));
         sourcePathView = text(sourcePath, Color.DKGRAY);
         sourcePathView.setTypeface(Typeface.MONOSPACE);
-        sourceBrowseButton = primaryButton("选择源目录");
-        enterButton = primaryButton("进入分类模式");
-        LinearLayout sourceRow = new LinearLayout(this);
-        sourceRow.setOrientation(LinearLayout.VERTICAL);
-        sourceRow.addView(sourceBrowseButton, new LinearLayout.LayoutParams(-1, -2));
-        sourceRow.addView(sourcePathView, new LinearLayout.LayoutParams(-1, -2));
-        sourceRow.addView(enterButton, new LinearLayout.LayoutParams(-1, -2));
-        task.addView(sourceRow);
-        LinearLayout options = row();
+        sourcePathView.setTextSize(13);
+        sourcePathView.setSingleLine(true);
+        sourcePathView.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        sourcePathView.setGravity(Gravity.CENTER_VERTICAL);
+        sourcePathView.setClickable(true);
+        sourcePathView.setFocusable(true);
+        sourcePathView.setContentDescription("分类源目录，点击选择目录");
+        sourceRow.addView(sourcePathView, new LinearLayout.LayoutParams(0, dp(48), 1));
+        if (portrait) {
+            sourceRow.removeAllViews();
+            sourceRow.addView(taskLabel, new LinearLayout.LayoutParams(-1, -2));
+            sourceRow.addView(sourcePathView, new LinearLayout.LayoutParams(-1, dp(48)));
+            sourceRow.setOrientation(LinearLayout.VERTICAL);
+            sourceRow.setGravity(Gravity.START);
+        }
+        taskBand.addView(sourceRow);
+
+        LinearLayout taskActions = row();
+        LinearLayout optionRow = taskActions;
+        LinearLayout commandRow = taskActions;
+        if (portrait) {
+            taskActions.setOrientation(LinearLayout.VERTICAL);
+            optionRow = row();
+            commandRow = row();
+            commandRow.setGravity(Gravity.END);
+            taskActions.addView(optionRow, new LinearLayout.LayoutParams(-1, -2));
+            taskActions.addView(commandRow, new LinearLayout.LayoutParams(-1, -2));
+        }
         overwriteCheck = new MaterialCheckBox(this);
         overwriteCheck.setText("覆盖同名文件");
         convertCheck = new MaterialCheckBox(this);
         convertCheck.setText("保存时转 WebP");
-        options.addView(overwriteCheck);
-        options.addView(convertCheck);
-        task.addView(options);
-        convertCurrentButton = button("仅转换当前");
-        deleteCurrentButton = button("删除当前");
+        optionRow.addView(overwriteCheck);
+        optionRow.addView(convertCheck);
+        downloadCurrentButton = iconButton(android.R.drawable.ic_menu_save, "下载当前原始文件");
+        convertCurrentButton = iconButton(android.R.drawable.ic_menu_manage, "仅转换当前图片为 WebP");
+        deleteCurrentButton = iconButton(android.R.drawable.ic_menu_delete, "删除当前远程文件");
         deleteCurrentButton.setTextColor(0xffb3261e);
         if (deleteCurrentButton instanceof MaterialButton) {
             MaterialButton danger = (MaterialButton) deleteCurrentButton;
-            danger.setStrokeColor(ColorStateList.valueOf(0xffb3261e));
-            danger.setStrokeWidth(dp(1));
+            danger.setIconTint(ColorStateList.valueOf(0xffb3261e));
         }
-        downloadCurrentButton = button("下载当前");
-        LinearLayout fileActions = row();
-        fileActions.addView(downloadCurrentButton, new LinearLayout.LayoutParams(0, -2, 1));
-        fileActions.addView(convertCurrentButton, new LinearLayout.LayoutParams(0, -2, 1));
-        fileActions.addView(deleteCurrentButton, new LinearLayout.LayoutParams(0, -2, 1));
-        task.addView(fileActions);
-        content.addView(task);
-
-        statsView = text("总文件 0 | 已提交 0 | 待保存 0 | 未处理 0", 0xff171c1b);
-        statsView.setPadding(0, dp(10), 0, dp(10));
-        content.addView(statsView);
+        taskBand.addView(taskActions);
 
         MaterialPanel filesPanel = panel();
-        filesPanel.addView(heading("当前目录文件", 17));
+        LinearLayout filesHeader = new LinearLayout(this);
+        filesHeader.setOrientation(LinearLayout.VERTICAL);
+        filesHeader.setPadding(0, 0, 0, dp(4));
+        TextView filesHeading = heading("当前目录文件", 16);
+        statsView = text("总文件 0 | 已提交 0 | 待保存 0 | 未处理 0", 0xff505a59);
+        statsView.setTextSize(11);
+        statsView.setSingleLine(false);
+        statsView.setMaxLines(2);
+        statsView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        statsView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        statsView.setPadding(0, 0, 0, dp(2));
+        filesHeader.addView(filesHeading, new LinearLayout.LayoutParams(-1, -2));
+        filesHeader.addView(statsView, new LinearLayout.LayoutParams(-1, -2));
+        filesPanel.addView(filesHeader);
         LinearLayout pageRow = row();
-        previousPageButton = button("上一页");
-        nextPageButton = button("下一页");
-        pageInfo = text("第 0 / 0 页", 0xff505a59);
+        previousPageButton = iconButton(android.R.drawable.ic_media_previous, "上一页");
+        previousPageButton.setContentDescription("上一页");
+        nextPageButton = iconButton(android.R.drawable.ic_media_next, "下一页");
+        nextPageButton.setContentDescription("下一页");
+        pageInfo = text("0 / 0", 0xff505a59);
         pageInfo.setGravity(Gravity.CENTER);
-        pageRow.addView(previousPageButton);
-        pageRow.addView(pageInfo, new LinearLayout.LayoutParams(0, -2, 1));
-        pageRow.addView(nextPageButton);
+        pageInfo.setMinWidth(dp(40));
+        pageRow.addView(previousPageButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        pageRow.addView(pageInfo, new LinearLayout.LayoutParams(0, dp(48), 1));
+        pageRow.addView(nextPageButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
         filesPanel.addView(pageRow);
-        fileList = new LinearLayout(this);
-        fileList.setOrientation(LinearLayout.VERTICAL);
-        ScrollView fileListScroll = new ScrollView(this);
-        fileListScroll.setFillViewport(true);
-        fileListScroll.addView(fileList, new ScrollView.LayoutParams(
-                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
-        int fileListHeight = Math.max(dp(260), Math.min(dp(380),
-                getResources().getDisplayMetrics().heightPixels / 3));
-        filesPanel.addView(fileListScroll, new LinearLayout.LayoutParams(-1, fileListHeight));
-        content.addView(filesPanel);
+        fileList = new RecyclerView(this);
+        fileList.setLayoutManager(new LinearLayoutManager(this));
+        fileList.setNestedScrollingEnabled(true);
+        fileAdapter = new FileListAdapter();
+        fileList.setAdapter(fileAdapter);
+        filesPanel.addView(fileList, new LinearLayout.LayoutParams(-1, 0, 1));
+        fileList.setBackgroundResource(R.drawable.preview_background);
+        fileList.setPadding(dp(2), dp(2), dp(2), dp(2));
 
         MaterialPanel previewPanel = panel();
-        LinearLayout previewHeader = row();
-        previewTitle = heading("预览", 17);
-        previousFileButton = button("上一个");
-        nextFileButton = button("下一个");
-        previewHeader.addView(previewTitle, new LinearLayout.LayoutParams(0, -2, 1));
-        previewHeader.addView(previousFileButton);
-        previewHeader.addView(nextFileButton);
-        previewPanel.addView(previewHeader);
+        previewTitle = heading("当前文件", 16);
+        previewTitle.setSingleLine(true);
+        previewTitle.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        previousFileButton = iconButton(android.R.drawable.ic_media_previous, "上一个");
+        nextFileButton = iconButton(android.R.drawable.ic_media_next, "下一个");
+        // Keep the semantic current-file node for accessibility and state restoration, while the
+        // visible preview intentionally has no filename header.
+        previewTitle.setVisibility(View.GONE);
+        previewPanel.addView(previewTitle, new LinearLayout.LayoutParams(0, 0));
         previewInfo = text("请选择文件", 0xff505a59);
-        previewInfo.setPadding(dp(10), dp(8), dp(10), dp(8));
         previewInfo.setBackgroundResource(R.drawable.preview_background);
-        previewPanel.addView(previewInfo);
-        imageView = new ZoomImageView(this);
+        previewInfo.setPadding(dp(10), dp(8), dp(10), dp(8));
+        previewInfo.setTextSize(12);
+        previewInfo.setMaxLines(4);
+        previewInfo.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        previewInfo.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        previewPanel.addView(previewInfo, new LinearLayout.LayoutParams(-1, -2));
+        FrameLayout previewImageHost = new FrameLayout(this);
+        imageView = new ImageView(this);
+        imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         imageView.setBackgroundResource(R.drawable.preview_background);
-        imageView.setContentDescription("图片预览，双指缩放，拖动查看");
-        imageView.setVisibility(View.GONE);
-        int previewHeight = Math.max(dp(220), Math.min(dp(420),
-                getResources().getDisplayMetrics().heightPixels / 3));
-        previewPanel.addView(imageView, new LinearLayout.LayoutParams(-1, previewHeight));
+        imageView.setContentDescription("当前图片预览，点按全屏查看");
+        previewImageHost.addView(imageView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         videoPlaceholder = new ImageView(this);
         videoPlaceholder.setImageResource(android.R.drawable.ic_media_play);
         videoPlaceholder.setContentDescription("在外部播放器中打开视频");
         videoPlaceholder.setVisibility(View.GONE);
-        previewPanel.addView(videoPlaceholder, new LinearLayout.LayoutParams(-1, dp(120)));
-        content.addView(previewPanel);
+        previewImageHost.addView(videoPlaceholder, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        previewImageHost.setContentDescription("当前文件预览区域，点按全屏查看");
+        previewImageHost.setOnClickListener(view -> openPreview());
+        previewPanel.addView(previewImageHost, new LinearLayout.LayoutParams(-1, 0, 1));
 
         MaterialPanel tagsPanel = panel();
-        tagsPanel.addView(heading("分类 tag", 17));
-        Button addTag = button("新增 tag");
-        Button manageTags = button("管理 tag");
-        Button clearTags = button("清空当前");
+        tagsPanel.setInnerPadding(dp(14), dp(6), dp(14), dp(6));
         LinearLayout tagActions = row();
-        tagActions.addView(addTag, new LinearLayout.LayoutParams(0, -2, 1));
-        tagActions.addView(manageTags, new LinearLayout.LayoutParams(0, -2, 1));
-        tagActions.addView(clearTags, new LinearLayout.LayoutParams(0, -2, 1));
+        tagActions.setGravity(Gravity.CENTER_VERTICAL);
+        tagActions.addView(heading("分类标签", 16), new LinearLayout.LayoutParams(0, -2, 1));
+        ImageButton addTag = compactIconButton(R.drawable.ic_tag_add, "新增标签");
+        tagActions.addView(addTag, new LinearLayout.LayoutParams(dp(40), dp(40)));
+        tagEditButton = compactIconButton(R.drawable.ic_tag_edit, "编辑标签");
+        tagEditButton.setContentDescription(tagEditMode ? "关闭标签编辑" : "编辑标签");
+        tagActions.addView(tagEditButton, new LinearLayout.LayoutParams(dp(40), dp(40)));
         tagsPanel.addView(tagActions);
+        ScrollView tagsScroll = new ScrollView(this);
+        tagsScroll.setFillViewport(true);
         tagList = new LinearLayout(this);
         tagList.setOrientation(LinearLayout.VERTICAL);
-        tagsPanel.addView(tagList);
-        saveButton = primaryButton("保存待提交");
-        tagsPanel.addView(saveButton);
-        content.addView(tagsPanel);
+        tagsScroll.addView(tagList, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+        tagsPanel.addView(tagsScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        filesPanel.fillHeight();
+        previewPanel.fillHeight();
+        tagsPanel.fillHeight();
+        addWorkspacePanels(filesPanel, previewPanel, tagsPanel);
 
-        sourceBrowseButton.setOnClickListener(view -> pickDirectory(sourcePath, selected -> {
+        sourcePathView.setOnClickListener(view -> pickDirectory(sourcePath, "lastSourceDirectory", selected -> {
             sourcePath = selected;
             sourcePathView.setText(sourcePath);
+            visiblePathView.setText(sourcePath);
+            saveLocalSettings();
+        }));
+        visiblePathView.setOnClickListener(view -> pickDirectory(sourcePath, "lastSourceDirectory", selected -> {
+            sourcePath = selected;
+            sourcePathView.setText(sourcePath);
+            visiblePathView.setText(sourcePath);
             saveLocalSettings();
         }));
         enterButton.setOnClickListener(view -> {
@@ -548,27 +902,118 @@ public final class MainActivity extends AppCompatActivity {
         previousFileButton.setOnClickListener(view -> setCurrentIndex(currentIndex - 1));
         nextFileButton.setOnClickListener(view -> setCurrentIndex(currentIndex + 1));
         addTag.setOnClickListener(view -> addTag());
-        manageTags.setOnClickListener(view -> manageTags());
-        clearTags.setOnClickListener(view -> clearCurrentTags());
+        tagEditButton.setOnClickListener(view -> setTagEditMode(!tagEditMode));
         saveButton.setOnClickListener(view -> savePending());
         downloadCurrentButton.setOnClickListener(view -> downloadCurrent());
         convertCurrentButton.setOnClickListener(view -> convertCurrent());
         deleteCurrentButton.setOnClickListener(view -> deleteCurrent());
-        overwriteCheck.setOnCheckedChangeListener((button, checked) -> overwrite = checked);
-        convertCheck.setOnCheckedChangeListener((button, checked) -> convertOnSave = checked);
         loadLocalSettings();
+        overwriteCheck.setOnCheckedChangeListener((button, checked) -> {
+            overwrite = checked;
+            saveLocalSettings();
+        });
+        convertCheck.setOnCheckedChangeListener((button, checked) -> {
+            convertOnSave = checked;
+            saveLocalSettings();
+        });
         refreshTags();
         updateStats();
-        applySystemBarInsets(root);
+        taskBand.setVisibility(View.GONE);
         setContentView(root);
+        ViewCompat.requestApplyInsets(root);
+        if (classificationMode) {
+            renderFileList();
+            renderCurrentFile();
+            refreshTags();
+            updateStats();
+        }
+        updateClassificationButton();
+        enterButton.setEnabled(!busy);
+    }
+
+    private void showTaskSettings() {
+        if (busy) {
+            showError("当前有任务正在进行，请等待完成");
+            return;
+        }
+        if (taskBand.getParent() instanceof ViewGroup) {
+            ((ViewGroup) taskBand.getParent()).removeView(taskBand);
+        }
+        taskBand.setVisibility(View.VISIBLE);
+        AlertDialog dialog = new MaterialAlertDialogBuilder(this)
+                .setTitle("分类任务设置")
+                .setView(taskBand)
+                .setPositiveButton("完成", (ignored, which) -> restoreTaskBand())
+                .create();
+        dialog.setOnDismissListener(ignored -> restoreTaskBand());
+        dialog.show();
+    }
+
+    private void restoreTaskBand() {
+        if (taskBand == null || taskBand.getParent() != null) return;
+        content.addView(taskBand, 0, new LinearLayout.LayoutParams(-1, -2));
+        taskBand.setVisibility(View.GONE);
+    }
+
+    private void addWorkspacePanels(MaterialPanel filesPanel,
+                                    MaterialPanel previewPanel, MaterialPanel tagsPanel) {
+        LinearLayout workspace = new LinearLayout(this);
+        boolean wide = isWideWorkspace();
+        workspace.setOrientation(wide ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+        workspace.setGravity(Gravity.TOP);
+        if (wide) {
+            workspace.addView(filesPanel, weightedWorkspaceParams(0.29f, 0, dp(4)));
+            workspace.addView(previewPanel, weightedWorkspaceParams(0.42f, dp(4), dp(4)));
+            workspace.addView(tagsPanel, weightedWorkspaceParams(0.29f, dp(4), 0));
+            content.addView(workspace, new LinearLayout.LayoutParams(-1, 0, 1));
+            return;
+        }
+
+        // On phones the desktop three-column layout becomes a single, readable flow.
+        // Give each workspace section a useful viewport instead of letting weighted
+        // children collapse while the parent is measured by a ScrollView.
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setClipToPadding(false);
+        LinearLayout.LayoutParams filesParams = mobileWorkspaceParams(dp(264), 0, dp(8));
+        LinearLayout.LayoutParams previewParams = mobileWorkspaceParams(dp(340), 0, dp(8));
+        LinearLayout.LayoutParams tagsParams = mobileWorkspaceParams(dp(320), 0, dp(8));
+        workspace.addView(filesPanel, filesParams);
+        workspace.addView(previewPanel, previewParams);
+        workspace.addView(tagsPanel, tagsParams);
+        scroll.addView(workspace, new ScrollView.LayoutParams(-1, -2));
+        content.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+    }
+
+    private LinearLayout.LayoutParams mobileWorkspaceParams(int height, int left, int bottom) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, height);
+        params.setMargins(left, 0, left, bottom);
+        return params;
+    }
+
+    private boolean isWideWorkspace() {
+        return getResources().getConfiguration().orientation
+                == Configuration.ORIENTATION_LANDSCAPE
+                && getResources().getConfiguration().screenWidthDp >= 600;
+    }
+
+    private LinearLayout.LayoutParams weightedWorkspaceParams(float weight, int left, int right) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -1, weight);
+        params.setMargins(left, 0, right, 0);
+        return params;
     }
 
     private void loadLocalSettings() {
         android.content.SharedPreferences prefs = getSharedPreferences("task", MODE_PRIVATE);
         sourcePath = Models.normalizeRemotePath(prefs.getString("sourcePath", sourcePath));
         sourcePathView.setText(sourcePath);
+        if (visiblePathView != null) visiblePathView.setText(sourcePath);
         overwrite = prefs.getBoolean("overwrite", false);
         convertOnSave = prefs.getBoolean("convertOnSave", false);
+        preloadConcurrency = Math.max(1, Math.min(10,
+                prefs.getInt("preloadConcurrency", DEFAULT_PRELOAD_CONCURRENCY)));
+        submitConcurrency = Math.max(1, Math.min(4,
+                prefs.getInt("submitConcurrency", DEFAULT_SUBMIT_CONCURRENCY)));
         overwriteCheck.setChecked(overwrite);
         convertCheck.setChecked(convertOnSave);
         tags.clear();
@@ -583,15 +1028,26 @@ public final class MainActivity extends AppCompatActivity {
     private void saveLocalSettings() {
         android.content.SharedPreferences.Editor editor = getSharedPreferences("task", MODE_PRIVATE).edit();
         editor.putString("sourcePath", sourcePath).putBoolean("overwrite", overwrite)
-                .putBoolean("convertOnSave", convertOnSave).putInt("tagCount", tags.size());
+                .putBoolean("convertOnSave", convertOnSave)
+                .putInt("preloadConcurrency", preloadConcurrency)
+                .putInt("submitConcurrency", submitConcurrency)
+                .putInt("tagCount", tags.size());
         for (int i = 0; i < tags.size(); i++) {
             editor.putString("tagName" + i, tags.get(i).name).putString("tagPath" + i, tags.get(i).targetPath);
         }
         editor.apply();
     }
 
-    private void pickDirectory(String startPath, RemoteDirectoryDialog.SelectionCallback callback) {
-        new RemoteDirectoryDialog(this, client, startPath, callback).show();
+    private void pickDirectory(String startPath, String historyKey,
+                               RemoteDirectoryDialog.SelectionCallback callback) {
+        android.content.SharedPreferences prefs = getSharedPreferences("task", MODE_PRIVATE);
+        String fallback = Models.normalizeRemotePath(startPath);
+        String remembered = Models.normalizeRemotePath(prefs.getString(historyKey, fallback));
+        new RemoteDirectoryDialog(this, client, remembered, selected -> {
+            String normalized = Models.normalizeRemotePath(selected);
+            prefs.edit().putString(historyKey, normalized).apply();
+            callback.onSelected(normalized);
+        }).show();
     }
 
     private void enterClassificationMode() {
@@ -600,8 +1056,7 @@ public final class MainActivity extends AppCompatActivity {
             return;
         }
         classificationMode = true;
-        enterButton.setText("退出分类模式");
-        previewCache.clear();
+        updateClassificationButton();
         files.clear();
         currentIndex = -1;
         updateStats();
@@ -610,7 +1065,7 @@ public final class MainActivity extends AppCompatActivity {
             setBusy(false, "");
             if (!ok) {
                 classificationMode = false;
-                enterButton.setText("进入分类模式");
+                updateClassificationButton();
                 showError(message);
                 return;
             }
@@ -628,6 +1083,7 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void exitClassificationMode() {
+        if (busy) return;
         int pending = pendingCount();
         if (pending > 0) {
             new MaterialAlertDialogBuilder(this).setTitle("退出分类模式")
@@ -640,15 +1096,18 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void finishClassificationMode() {
+        if (busy) return;
         ++preloadGeneration;
         classificationMode = false;
-        enterButton.setText("进入分类模式");
+        tagEditMode = false;
+        updateClassificationButton();
         files.clear();
         currentIndex = -1;
         currentPage = 0;
-        previewCache.clear();
         renderFileList();
+        refreshTags();
         updateStats();
+        renderCurrentFile();
         showInfo("已退出分类模式");
     }
 
@@ -673,84 +1132,91 @@ public final class MainActivity extends AppCompatActivity {
         if (currentIndex < start || currentIndex >= pageEnd()) currentIndex = start;
         renderFileList();
         renderCurrentFile();
+        refreshTags();
+        updateStats();
         preloadCurrentPage();
     }
 
     private void preloadCurrentPage() {
         final int generation = ++preloadGeneration;
-        final int start = currentPage * PAGE_SIZE;
-        final int end = pageEnd();
-        preloadNext(generation, start, end);
+        preloadQueue.clear();
+        preloadActiveCount = 0;
+        preloadCompletedCount = 0;
+        for (int index = currentPage * PAGE_SIZE; index < pageEnd()
+                && preloadQueue.size() < MAX_PRELOAD_ITEMS; index++) {
+            Models.RemoteEntry entry = files.get(index).entry;
+            if (Models.isImageFileName(entry.name) && entry.size <= MAX_PRELOAD_BYTES) {
+                preloadQueue.add(index);
+            }
+        }
+        preloadTotalCount = preloadQueue.size();
+        if (!classificationMode || busy || preloadTotalCount == 0) return;
+        if (progress != null) {
+            progress.setIndeterminate(false);
+            progress.setMax(preloadTotalCount);
+            progress.setProgress(0);
+            progress.setVisibility(View.VISIBLE);
+        }
+        if (status != null) status.setText("正在并发预热当前页: 0 / " + preloadTotalCount);
+        startPreloadWorkers(generation);
     }
 
-    private void preloadNext(int generation, int index, int end) {
-        if (generation != preloadGeneration || index >= end || !classificationMode) {
+    private void startPreloadWorkers(int generation) {
+        if (generation != preloadGeneration || !classificationMode || busy) return;
+        while (preloadActiveCount < preloadConcurrency && !preloadQueue.isEmpty()) {
+            int index = preloadQueue.removeFirst();
+            preloadActiveCount++;
+            preloadItem(generation, index);
+        }
+        if (preloadActiveCount == 0 && preloadQueue.isEmpty()) {
+            if (progress != null) progress.setVisibility(View.GONE);
+            if (status != null) status.setText("当前页缓存已准备: " + preloadCompletedCount
+                    + " / " + preloadTotalCount);
+        }
+    }
+
+    private void preloadItem(int generation, int index) {
+        if (index < 0 || index >= files.size()) {
+            finishPreloadItem(generation, "已跳过");
             return;
         }
         Models.FileItem item = files.get(index);
-        if (!Models.isImageFileName(item.entry.name)) {
-            preloadNext(generation, index + 1, end);
-            return;
-        }
-        Bitmap cachedImage = previewCache.loadImage(item.entry);
-        if (cachedImage != null) {
-            cachedImage.recycle();
-            preloadNext(generation, index + 1, end);
-            return;
-        }
-        byte[] cachedRaw = previewCache.loadRawData(item.entry);
-        if (cachedRaw != null) {
-            if (ImageConverter.isHeifLike(cachedRaw, item.entry.name)) {
-                final byte[] decodeData = cachedRaw;
-                new Thread(() -> {
-                    Bitmap image = ImageConverter.decode(decodeData);
-                    if (image != null) {
-                        previewCache.storeImage(item.entry, image);
-                        image.recycle();
+        try {
+            cacheExecutor.execute(() -> {
+                boolean imageCached = previewCache.hasImage(item.entry);
+                boolean rawCached = previewCache.hasRawData(item.entry);
+                mainHandler.post(() -> {
+                    if (generation != preloadGeneration || !classificationMode) return;
+                    if (imageCached || rawCached) {
+                        finishPreloadItem(generation, ImageConverter.isHeifLike(null, item.entry.name)
+                                ? "HEIF 原图已缓存" : "缓存命中");
+                    } else {
+                        fetchFileData(item, (ok, message, data) -> {
+                            if (generation != preloadGeneration || !classificationMode) return;
+                            finishPreloadItem(generation, ok
+                                    ? (ImageConverter.isHeifLike(data, item.entry.name)
+                                    ? "HEIF 原图已缓存" : "原图已缓存") : "读取失败");
+                        }, "正在预热 " + item.entry.name, true);
                     }
-                    mainHandler.post(() -> preloadNext(generation, index + 1, end));
-                }).start();
-            } else {
-                preloadNext(generation, index + 1, end);
-            }
-            return;
-        }
-        if (item.entry.rawUrl.isEmpty()) {
-            client.getFileInfo(item.entry.path, (ok, message, entry) -> {
-                if (generation != preloadGeneration) return;
-                if (ok && !entry.rawUrl.isEmpty()) {
-                    item.entry.rawUrl = entry.rawUrl;
-                    item.entry.thumb = entry.thumb;
-                    preloadDownload(generation, item, index, end);
-                } else {
-                    preloadNext(generation, index + 1, end);
-                }
+                });
             });
-        } else {
-            preloadDownload(generation, item, index, end);
+        } catch (RejectedExecutionException error) {
+            finishPreloadItem(generation, "任务已停止");
         }
     }
 
-    private void preloadDownload(int generation, Models.FileItem item, int index, int end) {
-        java.net.URL url = OpenListClient.resolveUrl(client.getBaseUrl(), item.entry.rawUrl);
-        client.downloadUrl(url, (ok, message, data) -> {
-            if (generation != preloadGeneration) return;
-            if (ok) {
-                previewCache.storeRawData(item.entry, data);
-                if (ImageConverter.isHeifLike(data, item.entry.name)) {
-                    new Thread(() -> {
-                        Bitmap image = ImageConverter.decode(data);
-                        if (image != null) {
-                            previewCache.storeImage(item.entry, image);
-                            image.recycle();
-                        }
-                        mainHandler.post(() -> preloadNext(generation, index + 1, end));
-                    }).start();
-                    return;
-                }
-            }
-            preloadNext(generation, index + 1, end);
-        }, null);
+    private void finishPreloadItem(int generation, String detail) {
+        if (generation != preloadGeneration || !classificationMode) return;
+        preloadActiveCount = Math.max(0, preloadActiveCount - 1);
+        preloadCompletedCount++;
+        if (progress != null) {
+            progress.setIndeterminate(false);
+            progress.setMax(Math.max(1, preloadTotalCount));
+            progress.setProgress(preloadCompletedCount);
+        }
+        if (status != null) status.setText("并发预热: " + preloadCompletedCount + " / "
+                + preloadTotalCount + " · " + detail);
+        startPreloadWorkers(generation);
     }
 
     private int pageCount() {
@@ -762,112 +1228,314 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void renderFileList() {
-        if (fileList == null) return;
-        fileList.removeAllViews();
+        if (fileList == null || fileAdapter == null) return;
+        fileAdapter.notifyDataSetChanged();
         int start = currentPage * PAGE_SIZE;
         int end = pageEnd();
-        for (int i = start; i < end; i++) {
-            final int fileIndex = i;
-            Models.FileItem item = files.get(fileIndex);
-            Button row = button((fileIndex + 1) + ". " + Models.statusText(item) + "  " + item.entry.name
-                    + (item.selectedTags.isEmpty() ? "" : "\n" + String.join(", ", item.selectedTags)));
-            row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-            row.setMinHeight(dp(54));
-            row.setOnClickListener(view -> setCurrentIndex(fileIndex));
-            if (fileIndex == currentIndex) row.setTextColor(0xff365cf5);
-            fileList.addView(row, new LinearLayout.LayoutParams(-1, -2));
-        }
         int pages = pageCount();
-        pageInfo.setText(pages == 0 ? "第 0 / 0 页" : "第 " + (currentPage + 1) + " / " + pages
-                + "  " + (start + 1) + "-" + end + " / " + files.size());
+        if (pages == 0) {
+            pageInfo.setText("0 / 0");
+        } else {
+            pageInfo.setText((currentPage + 1) + " / " + pages + "  "
+                    + (start + 1) + "-" + end + " / " + files.size());
+        }
         previousPageButton.setEnabled(classificationMode && !busy && currentPage > 0);
         nextPageButton.setEnabled(classificationMode && !busy && pages > 0 && currentPage < pages - 1);
     }
 
     private void renderCurrentFile() {
+        if (previewTitle == null || previewInfo == null || imageView == null
+                || videoPlaceholder == null) return;
         if (currentIndex < 0 || currentIndex >= files.size()) {
-            showInfo("请选择文件");
+            previewTitle.setText("预览");
+            previewInfo.setText(classificationMode ? "当前目录没有可预览文件" : "请选择源目录并进入分类模式");
+            imageView.setImageDrawable(null);
+            imageView.setVisibility(View.VISIBLE);
+            videoPlaceholder.setVisibility(View.GONE);
             return;
         }
         Models.FileItem item = files.get(currentIndex);
         previewTitle.setText(item.entry.name);
-        previewInfo.setText(formatEntryInfo(item));
-        imageView.setVisibility(View.GONE);
+        previewInfo.setText(formatPreviewInfo(item));
+        imageView.setImageDrawable(null);
         videoPlaceholder.setVisibility(View.GONE);
+        if (delayedPreviewRender != null || suppressPreviewRender) {
+            return;
+        }
         if (Models.isImageFileName(item.entry.name)) {
+            imageView.setVisibility(View.VISIBLE);
+            imageView.setContentDescription("当前图片预览: " + item.entry.name + "。点按全屏查看");
             loadImage(item);
         } else if (Models.isVideoFileName(item.entry.name)) {
+            imageView.setVisibility(View.GONE);
             videoPlaceholder.setVisibility(View.VISIBLE);
-            videoPlaceholder.setOnClickListener(view -> openRemote(item));
+            videoPlaceholder.setContentDescription("视频: " + item.entry.name + "。点按打开");
+            videoPlaceholder.setOnClickListener(view -> openPreview());
+        } else {
+            imageView.setVisibility(View.GONE);
         }
     }
 
     private void loadImage(Models.FileItem item) {
-        Bitmap cached = previewCache.loadImage(item.entry);
-        if (cached != null) {
-            imageView.setImageBitmap(cached);
-            imageView.setVisibility(View.VISIBLE);
-            imageView.resetView();
-            return;
+        if (status != null) status.setText("正在读取预览: " + item.entry.name);
+        try {
+            imageExecutor.execute(() -> {
+                Bitmap cached = previewCache.loadImage(item.entry,
+                        MAIN_PREVIEW_DECODE_LIMIT, MAIN_PREVIEW_DECODE_LIMIT, false);
+                mainHandler.post(() -> {
+                    if (!isCurrentItem(item)) return;
+                    if (cached != null) {
+                        previewCache.putImageInMemory(item.entry, cached);
+                        showDecodedImage(cached);
+                    } else {
+                        fetchFileData(item, (ok, message, data) -> {
+                            if (!isCurrentItem(item)) return;
+                            if (!ok) {
+                                previewInfo.setText(formatPreviewInfo(item) + "\n\n预览失败: " + message);
+                                return;
+                            }
+                            decodeAndShowImage(item, data);
+                        }, "正在读取 " + item.entry.name);
+                    }
+                });
+            });
+        } catch (RejectedExecutionException error) {
+            previewInfo.setText(formatPreviewInfo(item) + "\n\n图片任务已停止。");
         }
-        fetchFileData(item, (ok, message, data) -> {
-            if (currentIndex < 0 || currentIndex >= files.size()
-                    || !files.get(currentIndex).entry.path.equals(item.entry.path)) return;
-            if (!ok) {
-                showInfo(formatEntryInfo(item) + "\n\n预览失败: " + message);
-                return;
-            }
-            Bitmap image = ImageConverter.decode(data);
-            if (image == null) {
-                showInfo(formatEntryInfo(item) + "\n\n当前 Android 解码器不支持此图片格式。");
-                return;
-            }
-            if (ImageConverter.isHeifLike(data, item.entry.name)) {
-                previewCache.storeImage(item.entry, image);
-            }
-            imageView.setImageBitmap(image);
-            imageView.setVisibility(View.VISIBLE);
-            imageView.resetView();
-        }, "正在读取 " + item.entry.name);
     }
 
-    private void fetchFileData(Models.FileItem item, OpenListClient.DownloadCallback callback, String label) {
-        byte[] cached = previewCache.loadRawData(item.entry);
-        if (cached != null) {
-            callback.onResult(true, "cached", cached);
+    private void decodeAndShowImage(Models.FileItem item, byte[] data) {
+        decodeImageOnce(item, data, (image, cached) -> {
+            if (!isCurrentItem(item)) {
+                // A result that arrived after navigation/fullscreen was never assigned to the
+                // current ImageView. Only non-cached results may be recycled here.
+                if (!cached && image != null && !image.isRecycled()) image.recycle();
+                return;
+            }
+            if (image == null) {
+                previewInfo.setText(formatEntryInfo(item)
+                        + "\n\n系统图片与媒体解码器均不支持此格式。");
+            } else {
+                showDecodedImage(image);
+            }
+        });
+    }
+
+    private void decodeImageOnce(Models.FileItem item, byte[] data, ImageDecodeCallback callback) {
+        String key = downloadKey(item.entry);
+        ArrayList<ImageDecodeCallback> waiting = inFlightImageDecodes.get(key);
+        if (waiting != null) {
+            waiting.add(callback);
             return;
         }
+        waiting = new ArrayList<>();
+        waiting.add(callback);
+        inFlightImageDecodes.put(key, waiting);
+        final int writeGeneration = cacheGeneration;
+        try {
+            imageExecutor.execute(() -> {
+                // Large HEIF grid images can be tens of thousands of pixels wide. Keep the
+                // interactive preview bounded; full-resolution decoding remains available to
+                // the explicit conversion action.
+                // The embedded preview is physically smaller than the full-screen viewer. Keep
+                // it at 1024px so the returning Activity does not allocate a bitmap larger than
+                // the one that the outgoing full-screen Activity is releasing.
+                Bitmap image = ImageConverter.decodePreview(data,
+                        MAIN_PREVIEW_DECODE_LIMIT, MAIN_PREVIEW_DECODE_LIMIT);
+                boolean cached = false;
+                if (image != null && writeGeneration == cacheGeneration && !previewActive) {
+                    // The interactive bitmap is intentionally bounded. Do not write it to the
+                    // full-quality conversion cache; conversion fetches/decodes the original.
+                    cached = previewCache.putImageInMemory(item.entry, image);
+                }
+                Bitmap finalImage = image;
+                boolean finalCached = cached;
+                mainHandler.post(() -> finishImageDecode(key, finalImage, finalCached));
+            });
+        } catch (RejectedExecutionException error) {
+            finishImageDecode(key, null, false);
+        }
+    }
+
+    private void finishImageDecode(String key, Bitmap image, boolean cached) {
+        ArrayList<ImageDecodeCallback> callbacks = inFlightImageDecodes.remove(key);
+        if (callbacks == null) {
+            // The result may still be referenced by an ImageView during the fullscreen
+            // Activity transition. Let the bitmap become unreachable naturally instead of
+            // recycling it while a render pass can still be using the native buffer.
+            return;
+        }
+        for (ImageDecodeCallback callback : callbacks) callback.onResult(image, cached);
+    }
+
+    private boolean isCurrentItem(Models.FileItem item) {
+        return !previewActive && !suppressPreviewRender && !isFinishing() && !isDestroyed()
+                && currentIndex >= 0 && currentIndex < files.size()
+                && files.get(currentIndex).entry.path.equals(item.entry.path);
+    }
+
+    private void showDecodedImage(Bitmap image) {
+        imageView.setImageBitmap(image);
+        imageView.setVisibility(View.VISIBLE);
+        if (status != null) status.setText("预览已就绪，点按可全屏查看");
+    }
+
+    private void schedulePreviewRenderAfterFullscreen() {
+        if (!mainScreenVisible || isFinishing() || isDestroyed()) return;
+        if (delayedPreviewRender != null) mainHandler.removeCallbacks(delayedPreviewRender);
+        delayedPreviewRender = () -> {
+            delayedPreviewRender = null;
+            if (mainScreenVisible && !isFinishing() && !isDestroyed()) renderCurrentFile();
+        };
+        // Give the outgoing Activity and its last native decoder a moment to release graphics
+        // buffers before MainActivity allocates the next preview bitmap.
+        mainHandler.postDelayed(delayedPreviewRender, FULLSCREEN_RETURN_RENDER_DELAY_MS);
+    }
+
+    private void openPreview() {
+        if (currentIndex < 0 || currentIndex >= files.size()) return;
+        ArrayList<Models.PreviewItem> viewItems = new ArrayList<>();
+        int start = Math.max(0, currentIndex - MAX_PREVIEW_ITEMS / 2);
+        int end = Math.min(files.size(), start + MAX_PREVIEW_ITEMS);
+        start = Math.max(0, end - MAX_PREVIEW_ITEMS);
+        for (int i = start; i < end; i++) {
+            Models.FileItem item = files.get(i);
+            Models.PreviewItem preview = new Models.PreviewItem(item.entry);
+            preview.selectedTags.addAll(item.selectedTags);
+            preview.tagsEditable = !item.submitted;
+            viewItems.add(preview);
+        }
+        Intent intent = new Intent(this, PreviewActivity.class);
+        activePreviewSessionId = PreviewSessionStore.create(
+                viewItems, tagNames(), currentIndex - start);
+        intent.putExtra(PreviewActivity.EXTRA_SESSION_ID, activePreviewSessionId);
+        previewActive = true;
+        ++cacheGeneration;
+        imageView.setImageDrawable(null);
+        try {
+            startActivityForResult(intent, REQUEST_PREVIEW);
+            // The drawable is detached before the transition starts. Recycle only after a short
+            // renderer grace period and only while the full-screen Activity is still active.
+            mainHandler.postDelayed(() -> {
+                if (previewActive && imageView != null && imageView.getDrawable() == null) {
+                    previewCache.clearMemoryAndRecycle();
+                }
+            }, DETACHED_BITMAP_RECYCLE_DELAY_MS);
+        } catch (ActivityNotFoundException error) {
+            previewActive = false;
+            PreviewSessionStore.discard(activePreviewSessionId);
+            activePreviewSessionId = null;
+            renderCurrentFile();
+            showError("无法打开全屏预览页面。");
+        }
+    }
+
+    private ArrayList<String> tagNames() {
+        ArrayList<String> names = new ArrayList<>();
+        for (Models.TagMapping tag : tags) names.add(tag.name);
+        return names;
+    }
+
+    private void fetchFileData(Models.FileItem item, OpenListClient.DownloadCallback callback,
+                               String label) {
+        fetchFileData(item, callback, label, false);
+    }
+
+    private void fetchFileData(Models.FileItem item, OpenListClient.DownloadCallback callback,
+                               String label, boolean lowPriority) {
+        String key = downloadKey(item.entry);
+        ArrayList<OpenListClient.DownloadCallback> waiting = inFlightDownloads.get(key);
+        if (waiting != null) {
+            waiting.add(callback);
+            return;
+        }
+        waiting = new ArrayList<>();
+        waiting.add(callback);
+        inFlightDownloads.put(key, waiting);
+        try {
+            cacheExecutor.execute(() -> {
+                byte[] cached = previewCache.loadRawData(item.entry);
+                mainHandler.post(() -> {
+                    if (cached != null) {
+                        completeDownload(key, true, "cached", cached);
+                    } else {
+                        beginRemoteDownload(item, key, label, lowPriority);
+                    }
+                });
+            });
+        } catch (RejectedExecutionException error) {
+            completeDownload(key, false, "后台读取任务已停止", new byte[0]);
+        }
+    }
+
+    private void beginRemoteDownload(Models.FileItem item, String key, String label,
+                                     boolean lowPriority) {
         if (!item.entry.rawUrl.isEmpty()) {
-            downloadEntry(item.entry, OpenListClient.resolveUrl(client.getBaseUrl(), item.entry.rawUrl), callback, label);
+            downloadEntry(item.entry, OpenListClient.resolveUrl(client.getBaseUrl(), item.entry.rawUrl),
+                    key, label, lowPriority);
             return;
         }
         client.getFileInfo(item.entry.path, (ok, message, entry) -> {
             if (!ok || entry.rawUrl.isEmpty()) {
-                callback.onResult(false, ok ? "OpenList 没有返回下载地址。" : message, new byte[0]);
+                completeDownload(key, false, ok ? "OpenList 没有返回下载地址。" : message, new byte[0]);
                 return;
             }
             item.entry.rawUrl = entry.rawUrl;
             item.entry.thumb = entry.thumb;
-            downloadEntry(item.entry, OpenListClient.resolveUrl(client.getBaseUrl(), entry.rawUrl), callback, label);
+            downloadEntry(item.entry, OpenListClient.resolveUrl(client.getBaseUrl(), entry.rawUrl),
+                    key, label, lowPriority);
         });
     }
 
-    private void downloadEntry(Models.RemoteEntry entry, java.net.URL url,
-                               OpenListClient.DownloadCallback callback, String label) {
+    private void downloadEntry(Models.RemoteEntry entry, java.net.URL url, String key, String label,
+                               boolean lowPriority) {
+        final int writeGeneration = cacheGeneration;
         if (status != null) status.setText(label);
         client.downloadUrl(url, (ok, message, data) -> {
-            if (!busy && progress != null) progress.setVisibility(View.GONE);
-            if (ok) previewCache.storeRawData(entry, data);
-            callback.onResult(ok, message, data);
-        }, (received, total) -> mainHandler.post(() -> {
-            if (isFinishing() || isDestroyed()) return;
-            if (progress != null) {
-                progress.setVisibility(View.VISIBLE);
-                progress.setIndeterminate(total <= 0);
-                if (total > 0) progress.setProgress((int) Math.min(100, received * 100 / total));
+            if (!ok) {
+                completeDownload(key, false, message, data);
+                return;
             }
-            if (status != null) status.setText(label + ": " + Models.formatBytes(received));
-        }));
+            try {
+                cacheExecutor.execute(() -> {
+                    if (writeGeneration == cacheGeneration) previewCache.storeRawData(entry, data);
+                    mainHandler.post(() -> completeDownload(key, true, message, data));
+                });
+            } catch (RejectedExecutionException error) {
+                completeDownload(key, true, message, data);
+            }
+        }, (received, total) -> {
+            long now = android.os.SystemClock.uptimeMillis();
+            synchronized (this) {
+                if (received != total && now - lastProgressUiUpdate < 120L) return;
+                lastProgressUiUpdate = now;
+            }
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (progress != null && preloadActiveCount == 0 && submitActiveCount == 0) {
+                    progress.setVisibility(View.VISIBLE);
+                    progress.setIndeterminate(total <= 0);
+                    if (total > 0) {
+                        progress.setMax(100);
+                        progress.setProgress((int) Math.min(100, received * 100 / total));
+                    }
+                }
+                if (status != null) status.setText(label + ": " + Models.formatBytes(received));
+            });
+        }, lowPriority);
+    }
+
+    private void completeDownload(String key, boolean ok, String message, byte[] data) {
+        ArrayList<OpenListClient.DownloadCallback> callbacks = inFlightDownloads.remove(key);
+        if (callbacks == null) return;
+        if (!busy && preloadActiveCount == 0 && progress != null) progress.setVisibility(View.GONE);
+        for (OpenListClient.DownloadCallback callback : callbacks) {
+            callback.onResult(ok, message, data);
+        }
+    }
+
+    private static String downloadKey(Models.RemoteEntry entry) {
+        return entry.path + "\n" + entry.size + "\n" + entry.modified;
     }
 
     private void addTag() {
@@ -878,13 +1546,11 @@ public final class MainActivity extends AppCompatActivity {
         EditText path = input("目标目录");
         path.setText("/");
         path.setFocusable(false);
-        Button choosePath = button("选择目录");
-        LinearLayout pathRow = row();
-        pathRow.addView(labelled("目标目录", path), new LinearLayout.LayoutParams(0, -2, 1));
-        pathRow.addView(choosePath);
+        path.setClickable(true);
+        path.setContentDescription("目标目录，点击选择目录");
         form.addView(labelled("Tag 名称", name));
-        form.addView(pathRow);
-        choosePath.setOnClickListener(view -> pickDirectory(path.getText().toString(), path::setText));
+        form.addView(labelled("目标目录", path));
+        path.setOnClickListener(view -> pickDirectory(path.getText().toString(), "lastTagDirectory", path::setText));
         new MaterialAlertDialogBuilder(this).setTitle("新增 tag").setView(form)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialog, which) -> {
@@ -934,13 +1600,11 @@ public final class MainActivity extends AppCompatActivity {
         name.setText(original.name);
         path.setText(original.targetPath);
         path.setFocusable(false);
-        Button choosePath = button("选择目录");
-        LinearLayout pathRow = row();
-        pathRow.addView(labelled("目标目录", path), new LinearLayout.LayoutParams(0, -2, 1));
-        pathRow.addView(choosePath);
+        path.setClickable(true);
+        path.setContentDescription("目标目录，点击选择目录");
         form.addView(labelled("Tag 名称", name));
-        form.addView(pathRow);
-        choosePath.setOnClickListener(view -> pickDirectory(path.getText().toString(), path::setText));
+        form.addView(labelled("目标目录", path));
+        path.setOnClickListener(view -> pickDirectory(path.getText().toString(), "lastTagDirectory", path::setText));
         new MaterialAlertDialogBuilder(this).setTitle("编辑 tag").setView(form)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialog, which) -> {
@@ -989,28 +1653,89 @@ public final class MainActivity extends AppCompatActivity {
     private void refreshTags() {
         if (tagList == null) return;
         tagList.removeAllViews();
+        boolean editing = tagEditMode;
         if (tags.isEmpty()) {
-            tagList.addView(text("请先新增 tag，并为 tag 填写目标目录。", 0xff505a59));
+            TextView hint = text("请先新增 tag，并为 tag 填写目标目录。", 0xff505a59);
+            hint.setPadding(dp(4), dp(10), dp(4), dp(10));
+            tagList.addView(hint);
         }
-        for (Models.TagMapping tag : tags) {
-            CheckBox check = new MaterialCheckBox(this);
-            check.setText(tag.name + "\n" + tag.targetPath);
-            check.setTag(tag.name);
-            Models.FileItem item = currentIndex >= 0 && currentIndex < files.size() ? files.get(currentIndex) : null;
-            check.setEnabled(classificationMode && item != null && !item.submitted && !busy);
-            check.setChecked(item != null && item.selectedTags.contains(tag.name));
-            check.setOnCheckedChangeListener((button, checked) -> {
-                if (currentIndex < 0 || currentIndex >= files.size()) return;
-                Models.FileItem selected = files.get(currentIndex);
-                if (selected.submitted) return;
-                if (checked && !selected.selectedTags.contains(tag.name)) selected.selectedTags.add(tag.name);
-                if (!checked) selected.selectedTags.remove(tag.name);
-                selected.failed = false;
-                selected.lastError = "";
-                renderFileList();
-                updateStats();
-            });
-            tagList.addView(check);
+        for (int start = 0; start < tags.size(); start += 2) {
+            LinearLayout tagRow = new LinearLayout(this);
+            tagRow.setOrientation(LinearLayout.HORIZONTAL);
+            tagRow.setGravity(Gravity.CENTER_VERTICAL);
+            for (int column = 0; column < 2; column++) {
+                int tagIndex = start + column;
+                if (tagIndex >= tags.size()) {
+                    tagRow.addView(new View(this), new LinearLayout.LayoutParams(0, dp(48), 1));
+                    continue;
+                }
+                Models.TagMapping tag = tags.get(tagIndex);
+                FrameLayout tagCell = new FrameLayout(this);
+                tagCell.setPadding(column > 0 ? dp(4) : 0, 0, 0, 0);
+                MaterialCheckBox check = new MaterialCheckBox(this);
+                check.setText(tag.name);
+                check.setTextSize(13);
+                check.setGravity(Gravity.CENTER_VERTICAL);
+                check.setMinHeight(dp(48));
+                check.setMinimumHeight(dp(48));
+                check.setPadding(0, 0, 0, 0);
+                check.setSingleLine(true);
+                check.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                check.setContentDescription("tag " + tag.name + "，目标目录 " + tag.targetPath);
+                check.setTag(tag.name);
+                check.setVisibility(editing ? View.GONE : View.VISIBLE);
+                Models.FileItem item = currentIndex >= 0 && currentIndex < files.size()
+                        ? files.get(currentIndex) : null;
+                check.setEnabled(classificationMode && item != null && !item.submitted && !busy);
+                check.setChecked(item != null && item.selectedTags.contains(tag.name));
+                check.setOnCheckedChangeListener((button, checked) -> {
+                    if (currentIndex < 0 || currentIndex >= files.size()) return;
+                    Models.FileItem selected = files.get(currentIndex);
+                    if (selected.submitted) return;
+                    if (checked && !selected.selectedTags.contains(tag.name)) selected.selectedTags.add(tag.name);
+                    if (!checked) selected.selectedTags.remove(tag.name);
+                    selected.failed = false;
+                    selected.lastError = "";
+                    renderFileList();
+                    updateStats();
+                });
+                tagCell.addView(check, new FrameLayout.LayoutParams(-1, dp(48)));
+                TextView editLabel = text(tag.name, getColorCompat(R.color.on_surface));
+                editLabel.setTextSize(13);
+                editLabel.setGravity(Gravity.CENTER_VERTICAL);
+                editLabel.setSingleLine(true);
+                editLabel.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                editLabel.setPadding(0, 0, dp(36), 0);
+                editLabel.setContentDescription("编辑标签 " + tag.name + "，目标目录 " + tag.targetPath);
+                editLabel.setClickable(true);
+                editLabel.setFocusable(true);
+                editLabel.setEnabled(!busy);
+                editLabel.setVisibility(editing ? View.VISIBLE : View.GONE);
+                editLabel.setOnClickListener(view -> {
+                    int currentTagIndex = tags.indexOf(tag);
+                    if (currentTagIndex >= 0) editTag(currentTagIndex);
+                });
+                tagCell.addView(editLabel, new FrameLayout.LayoutParams(-1, dp(48)));
+                ImageButton remove = compactIconButton(android.R.drawable.ic_menu_delete,
+                        "删除标签 " + tag.name);
+                remove.setImageTintList(ColorStateList.valueOf(getColorCompat(R.color.error)));
+                remove.setEnabled(!busy);
+                remove.setVisibility(editing ? View.VISIBLE : View.GONE);
+                remove.setOnClickListener(view -> {
+                    int currentTagIndex = tags.indexOf(tag);
+                    if (currentTagIndex >= 0) removeTag(currentTagIndex);
+                });
+                FrameLayout.LayoutParams removeParams = new FrameLayout.LayoutParams(
+                        dp(40), dp(40), Gravity.END | Gravity.CENTER_VERTICAL);
+                tagCell.addView(remove, removeParams);
+                tagRow.addView(tagCell, new LinearLayout.LayoutParams(0, dp(48), 1));
+            }
+            tagList.addView(tagRow, new LinearLayout.LayoutParams(-1, dp(48)));
+            if (start + 2 < tags.size()) {
+                View divider = new View(this);
+                divider.setBackgroundColor(getColorCompat(R.color.outline_variant));
+                tagList.addView(divider, new LinearLayout.LayoutParams(-1, 1));
+            }
         }
     }
 
@@ -1023,6 +1748,31 @@ public final class MainActivity extends AppCompatActivity {
             renderFileList();
             updateStats();
         }
+    }
+
+    private void setTagEditMode(boolean enabled) {
+        if (busy) return;
+        tagEditMode = enabled;
+        if (tagEditButton != null) {
+            tagEditButton.setContentDescription(tagEditMode ? "关闭标签编辑" : "编辑标签");
+        }
+        refreshTags();
+    }
+
+    private void showTagActions() {
+        new MaterialAlertDialogBuilder(this).setTitle("标签操作")
+                .setItems(new String[]{"管理标签", "清空当前文件标签"}, (dialog, which) -> {
+                    if (which == 0) manageTags();
+                    else clearCurrentTags();
+                }).show();
+    }
+
+    private void updateClassificationButton() {
+        if (enterButton == null) return;
+        enterButton.setText(null);
+        ((MaterialButton) enterButton).setIconResource(classificationMode
+                ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play);
+        enterButton.setContentDescription(classificationMode ? "退出分类模式" : "进入分类模式");
     }
 
     private void savePending() {
@@ -1042,39 +1792,104 @@ public final class MainActivity extends AppCompatActivity {
             showInfo("当前没有已选择但未提交的文件");
             return;
         }
-        String message = "将顺序处理 " + pending.size() + " 个文件。";
+        String message = "将并发处理 " + pending.size() + " 个文件（最多 " + submitConcurrency + " 个同时进行）。";
         if (multi) message += "多 tag 文件会复制到多个目标目录。";
-        if (converted > 0) message += "图片会转 WebP，全部上传成功后删除源文件。";
+        if (converted > 0) message += "图片保持原分辨率转 WebP，全部上传成功后删除源文件。";
         new MaterialAlertDialogBuilder(this).setTitle("确认保存").setMessage(message)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("保存", (dialog, which) -> submitNext(pending, 0)).show();
+                .setPositiveButton("保存", (dialog, which) -> startSubmitBatch(pending)).show();
     }
 
-    private void submitNext(ArrayList<Integer> indexes, int position) {
-        if (position >= indexes.size()) {
+    private void startSubmitBatch(ArrayList<Integer> indexes) {
+        ++preloadGeneration;
+        submitQueue = new ArrayList<>(indexes);
+        convertedUploadQueues.clear();
+        submitQueuePosition = 0;
+        submitActiveCount = 0;
+        submitCompletedCount = 0;
+        setBusy(true, "正在并发提交: 0 / " + submitQueue.size());
+        if (progress != null) {
+            progress.setIndeterminate(false);
+            progress.setMax(Math.max(1, submitQueue.size()));
+            progress.setProgress(0);
+        }
+        boolean convertsImages = false;
+        if (convertOnSave) {
+            for (int index : indexes) {
+                if (index >= 0 && index < files.size()
+                        && Models.isImageFileName(files.get(index).entry.name)) {
+                    convertsImages = true;
+                    break;
+                }
+            }
+        }
+        if (convertsImages) {
+            suppressPreviewRender = true;
+            releaseInteractivePreviewForLargeWork(this::startSubmitWorkers);
+        } else {
+            startSubmitWorkers();
+        }
+    }
+
+    private void startSubmitWorkers() {
+        while (submitActiveCount < submitConcurrency && submitQueuePosition < submitQueue.size()) {
+            int index = submitQueue.get(submitQueuePosition++);
+            if (index < 0 || index >= files.size()) {
+                submitCompletedCount++;
+                continue;
+            }
+            submitActiveCount++;
+            if (status != null) status.setText("正在并发提交 " + submitCompletedCount + " / "
+                    + submitQueue.size() + ": " + files.get(index).entry.name);
+            submitFile(index, (ok, message) -> mainHandler.post(
+                    () -> finishSubmittedFile(index, ok, message)));
+        }
+        if (submitActiveCount == 0 && submitCompletedCount >= submitQueue.size()) {
+            int succeeded = 0;
+            for (int index : submitQueue) {
+                if (index >= 0 && index < files.size() && files.get(index).submitted) succeeded++;
+            }
+            int failed = submitQueue.size() - succeeded;
             setBusy(false, "保存完成");
-            showInfo("待提交操作已经处理完成");
-            return;
+            if (suppressPreviewRender) {
+                suppressPreviewRender = false;
+                renderCurrentFile();
+            }
+            showInfo("批量处理完成: 成功 " + succeeded + "，失败 " + failed
+                    + (failed > 0 ? "。失败项已保留，可再次保存重试。" : "。"));
         }
-        int index = indexes.get(position);
-        if (index < 0 || index >= files.size()) {
-            submitNext(indexes, position + 1);
-            return;
-        }
-        setBusy(true, "正在提交 " + (position + 1) + " / " + indexes.size() + ": " + files.get(index).entry.name);
-        submitFile(index, (ok, message) -> {
+    }
+
+    private void finishSubmittedFile(int index, boolean ok, String message) {
+        if (index >= 0 && index < files.size()) {
             Models.FileItem item = files.get(index);
             item.submitted = ok;
             item.failed = !ok;
             item.lastError = ok ? "" : message;
-            renderFileList();
-            updateStats();
-            if (index == currentIndex) refreshTags();
-            submitNext(indexes, position + 1);
-        });
+        }
+        submitActiveCount = Math.max(0, submitActiveCount - 1);
+        submitCompletedCount++;
+        if (progress != null) {
+            progress.setIndeterminate(false);
+            progress.setMax(Math.max(1, submitQueue.size()));
+            progress.setProgress(submitCompletedCount);
+        }
+        if (status != null) status.setText("并发提交: " + submitCompletedCount + " / "
+                + submitQueue.size());
+        renderFileList();
+        updateStats();
+        if (index == currentIndex) {
+            refreshTags();
+            if (!suppressPreviewRender) renderCurrentFile();
+        }
+        startSubmitWorkers();
     }
 
     private void submitFile(int index, OpenListClient.SimpleCallback callback) {
+        if (index < 0 || index >= files.size()) {
+            callback.onResult(false, "文件列表已经变化，请重新选择后提交");
+            return;
+        }
         Models.FileItem item = files.get(index);
         ArrayList<String> uniqueTargets = new ArrayList<>();
         ArrayList<String> selectedTargets = new ArrayList<>();
@@ -1088,66 +1903,102 @@ public final class MainActivity extends AppCompatActivity {
             if (!uniqueTargets.contains(tag.targetPath)) uniqueTargets.add(tag.targetPath);
         }
         if (convertOnSave && Models.isImageFileName(item.entry.name)) {
-            submitConverted(index, uniqueTargets, callback);
+            submitConverted(item, uniqueTargets, callback);
         } else if (item.selectedTags.size() == 1) {
             client.moveFile(sourcePath, item.entry.name, selectedTargets.get(0), overwrite, callback);
         } else {
-            copyTargets(index, selectedTargets, 0, callback);
+            copyTargets(item, uniqueTargets, 0, callback);
         }
     }
 
-    private void copyTargets(int index, ArrayList<String> targets, int position,
+    private void copyTargets(Models.FileItem item, ArrayList<String> targets, int position,
                              OpenListClient.SimpleCallback callback) {
         if (position >= targets.size()) {
             callback.onResult(true, "复制完成");
             return;
         }
-        client.copyFile(sourcePath, files.get(index).entry.name, targets.get(position), overwrite,
-                (ok, message) -> {
+        client.copyFile(Models.parentRemotePath(item.entry.path), item.entry.name,
+                targets.get(position), overwrite, (ok, message) -> {
                     if (!ok) callback.onResult(false, message);
-                    else copyTargets(index, targets, position + 1, callback);
+                    else copyTargets(item, targets, position + 1, callback);
                 });
     }
 
-    private void submitConverted(int index, ArrayList<String> targets, OpenListClient.SimpleCallback callback) {
-        Models.FileItem item = files.get(index);
+    private void submitConverted(Models.FileItem item, ArrayList<String> targets,
+                                 OpenListClient.SimpleCallback callback) {
         fetchFileData(item, (ok, message, data) -> {
             if (!ok) {
                 callback.onResult(false, "获取待转换图片失败: " + message);
                 return;
             }
-            new Thread(() -> {
-                byte[] conversionData = data;
-                String hashSource = "原始文件";
-                if (ImageConverter.isHeifLike(data, item.entry.name)) {
-                    conversionData = previewCache.loadDecodedJpeg(item.entry);
-                    if (conversionData == null) {
-                        conversionData = ImageConverter.decodeToFullQualityJpeg(data);
-                        if (conversionData != null) {
-                            previewCache.storeDecodedJpeg(item.entry, conversionData);
+            try {
+                imageExecutor.execute(() -> {
+                    final ImageConverter.Result converted;
+                    // Network submission can remain concurrent, but full-resolution decode and
+                    // encode must be serialized. Otherwise two 12 MP bitmaps can overlap while
+                    // one worker compresses and another worker starts decoding.
+                    synchronized (FULL_RESOLUTION_CONVERSION_LOCK) {
+                        byte[] conversionData = data;
+                        String hashSource = "原始文件";
+                        if (ImageConverter.isHeifLike(data, item.entry.name)) {
+                            conversionData = previewCache.loadDecodedJpeg(item.entry);
+                            if (conversionData == null) {
+                                conversionData = ImageConverter.decodeToFullQualityJpeg(data);
+                                if (conversionData != null) {
+                                    previewCache.storeDecodedJpeg(item.entry, conversionData);
+                                }
+                            }
+                            hashSource = "HEIF 原分辨率解码 JPG 缓存";
                         }
+                        converted = conversionData == null
+                                ? conversionFailure(hashSource, "HEIF/AVIF 原分辨率解码缓存生成失败。")
+                                : ImageConverter.convertToWebp(conversionData, hashSource);
                     }
-                    hashSource = "HEIF 解码 JPG 缓存";
-                }
-                final ImageConverter.Result converted = conversionData == null
-                        ? conversionFailure(hashSource, "HEIF/AVIF 解码缓存生成失败。")
-                        : ImageConverter.convertToWebp(conversionData, hashSource);
-                mainHandler.post(() -> {
-                    if (isFinishing() || isDestroyed()) return;
-                    if (!converted.ok) {
-                        callback.onResult(false, converted.message);
-                        return;
-                    }
-                    uploadConverted(index, converted, targets, 0, callback);
+                    mainHandler.post(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        if (!converted.ok) {
+                            callback.onResult(false, converted.message);
+                            return;
+                        }
+                        enqueueConvertedUpload(converted.outputName, () ->
+                                uploadConverted(item, converted, targets, 0, (uploadOk, uploadMessage) -> {
+                                    try {
+                                        callback.onResult(uploadOk, uploadMessage);
+                                    } finally {
+                                        finishConvertedUpload(converted.outputName);
+                                    }
+                                }));
+                    });
                 });
-            }).start();
+            } catch (RejectedExecutionException error) {
+                callback.onResult(false, "图片转换任务已停止");
+            }
         }, "正在读取待转换图片");
     }
 
-    private void uploadConverted(int index, ImageConverter.Result converted, ArrayList<String> targets,
-                                 int position, OpenListClient.SimpleCallback callback) {
+    private void enqueueConvertedUpload(String outputName, Runnable upload) {
+        ArrayDeque<Runnable> queue = convertedUploadQueues.computeIfAbsent(
+                outputName, ignored -> new ArrayDeque<>());
+        queue.addLast(upload);
+        if (queue.size() == 1) upload.run();
+    }
+
+    private void finishConvertedUpload(String outputName) {
+        ArrayDeque<Runnable> queue = convertedUploadQueues.get(outputName);
+        if (queue == null || queue.isEmpty()) return;
+        queue.removeFirst();
+        if (queue.isEmpty()) {
+            convertedUploadQueues.remove(outputName);
+        } else {
+            queue.peekFirst().run();
+        }
+    }
+
+    private void uploadConverted(Models.FileItem item, ImageConverter.Result converted,
+                                 ArrayList<String> targets, int position,
+                                 OpenListClient.SimpleCallback callback) {
         if (position >= targets.size()) {
-            client.removeFile(Models.parentRemotePath(files.get(index).entry.path), files.get(index).entry.name,
+            client.removeFile(Models.parentRemotePath(item.entry.path), item.entry.name,
                     (ok, message) -> callback.onResult(ok, ok
                             ? "已转 WebP 并处理 " + targets.size() + " 个目标目录: " + converted.outputName
                             : "转换上传已完成，但删除源文件失败: " + message));
@@ -1164,8 +2015,7 @@ public final class MainActivity extends AppCompatActivity {
                 if (entry.isDir || !Models.lowerSuffix(entry.name).equals("webp")) {
                     continue;
                 }
-                if (index >= 0 && index < files.size()
-                        && entry.path.equals(files.get(index).entry.path)) {
+                if (entry.path.equals(item.entry.path)) {
                     continue;
                 }
                 String base = entry.name;
@@ -1177,18 +2027,17 @@ public final class MainActivity extends AppCompatActivity {
                 }
             }
             if (duplicate) {
-                uploadConverted(index, converted, targets, position + 1, callback);
+                uploadConverted(item, converted, targets, position + 1, callback);
                 return;
             }
-            if (index >= 0 && index < files.size()
-                    && Models.normalizeRemotePath(uploadPath)
-                    .equals(Models.normalizeRemotePath(files.get(index).entry.path))) {
+            if (Models.normalizeRemotePath(uploadPath)
+                    .equals(Models.normalizeRemotePath(item.entry.path))) {
                 callback.onResult(false, "当前文件已经是目标 WebP 文件，无需转换。");
                 return;
             }
             client.uploadFile(uploadPath, converted.data, overwrite, (uploadOk, uploadMessage) -> {
                 if (!uploadOk) callback.onResult(false, "上传 WebP 失败: " + uploadMessage);
-                else uploadConverted(index, converted, targets, position + 1, callback);
+                else uploadConverted(item, converted, targets, position + 1, callback);
             });
         });
     }
@@ -1239,8 +2088,11 @@ public final class MainActivity extends AppCompatActivity {
                     targets.add(Models.parentRemotePath(item.entry.path));
                     ++preloadGeneration;
                     setBusy(true, "正在转换当前图片: " + item.entry.name);
-                    submitConverted(conversionIndex, targets, (ok, message) -> {
+                    suppressPreviewRender = true;
+                    releaseInteractivePreviewForLargeWork(() -> submitConverted(
+                            item, targets, (ok, message) -> {
                         setBusy(false, "");
+                        suppressPreviewRender = false;
                         if (conversionIndex >= 0 && conversionIndex < files.size()
                                 && files.get(conversionIndex).entry.path.equals(item.entry.path)) {
                             item.submitted = ok;
@@ -1249,9 +2101,28 @@ public final class MainActivity extends AppCompatActivity {
                         }
                         renderFileList();
                         updateStats();
+                        refreshTags();
+                        renderCurrentFile();
                         if (ok) showInfo(message); else showError(message);
-                    });
+                    }));
                 }).show();
+    }
+
+    private void releaseInteractivePreviewForLargeWork(Runnable continuation) {
+        ++cacheGeneration;
+        if (imageView == null) {
+            previewCache.clearMemory();
+            continuation.run();
+            return;
+        }
+        imageView.setImageDrawable(null);
+        mainHandler.postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            if (imageView != null && imageView.getDrawable() == null) {
+                previewCache.clearMemoryAndRecycle();
+            }
+            continuation.run();
+        }, DETACHED_BITMAP_RECYCLE_DELAY_MS);
     }
 
     private void deleteCurrent() {
@@ -1284,6 +2155,9 @@ public final class MainActivity extends AppCompatActivity {
                                                     }
                                                     showError("删除失败: " + message);
                                                     renderFileList();
+                                                    refreshTags();
+                                                    updateStats();
+                                                    renderCurrentFile();
                                                     return;
                                                 }
                                                 files.remove(item);
@@ -1291,26 +2165,186 @@ public final class MainActivity extends AppCompatActivity {
                                                 currentPage = Math.max(0, currentIndex / PAGE_SIZE);
                                                 renderFileList();
                                                 updateStats();
+                                                refreshTags();
                                                 renderCurrentFile();
                                             });
                                 }).show()).show();
     }
 
     private void showMoreActions() {
-        String[] actions = {"连接信息", "清空全部未提交选择", "清理预览缓存", "关于"};
-        new MaterialAlertDialogBuilder(this).setTitle("更多操作").setItems(actions, (dialog, which) -> {
-            if (which == 0) {
-                showConnectionDiagnostics();
-            } else if (which == 1) {
-                clearAllPendingSelections();
-            } else if (which == 2) {
-                previewCache.clear();
-                showInfo("预览缓存已清理");
-                renderCurrentFile();
-            } else {
-                showInfo("关于", "OpenList Sorter Android 0.1.0\n\n基于 Qt 版工作流实现的 OpenList 远程文件分类工具。");
+        if (busy) {
+            showError("当前有任务正在进行，请等待完成");
+            return;
+        }
+        LinearLayout page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setPadding(0, dp(4), 0, dp(4));
+        TextView taskSection = text("工作区", getColorCompat(R.color.on_surface_variant));
+        taskSection.setTextSize(12);
+        taskSection.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        taskSection.setPadding(dp(16), dp(8), dp(16), dp(4));
+        page.addView(taskSection);
+        addSettingsAction(page, "分类任务", "源目录、分类状态与保存选项", this::showTaskSettings);
+        addSettingsAction(page, "连接信息", client.getBaseUrl(), this::showConnectionDiagnostics);
+        TextView localSection = text("本地数据", getColorCompat(R.color.on_surface_variant));
+        localSection.setTextSize(12);
+        localSection.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        localSection.setPadding(dp(16), dp(14), dp(16), dp(4));
+        page.addView(localSection);
+        addSettingsAction(page, "性能与缓存", "预热、提交并发和缓存状态", this::showPerformanceSettings);
+        addSettingsAction(page, "清空未提交选择", "只清除本地 tag，不修改远程文件", this::clearAllPendingSelections);
+        addSettingsAction(page, "清理预览缓存", "释放本地预览缓存空间", this::confirmClearPreviewCache);
+        TextView aboutSection = text("应用", getColorCompat(R.color.on_surface_variant));
+        aboutSection.setTextSize(12);
+        aboutSection.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        aboutSection.setPadding(dp(16), dp(14), dp(16), dp(4));
+        page.addView(aboutSection);
+        addSettingsAction(page, "关于", "OpenList Sorter Android " + appVersionName(), () ->
+                showInfo("关于", "OpenList Sorter Android " + appVersionName()
+                        + "\n\n基于 Qt 版工作流实现的 OpenList 远程文件分类工具。"));
+        addSettingsAction(page, "注销", "断开连接并关闭自动登录", this::logout, true);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(page);
+        AlertDialog settingsDialog = new MaterialAlertDialogBuilder(this).setTitle("设置")
+                .setView(scroll).setNegativeButton("关闭", null).create();
+        bindSettingsActions(page, settingsDialog);
+        settingsDialog.show();
+    }
+
+    private void addSettingsAction(LinearLayout parent, String title, String summary, Runnable action) {
+        addSettingsAction(parent, title, summary, action, false);
+    }
+
+    private void addSettingsAction(LinearLayout parent, String title, String summary,
+                                   Runnable action, boolean danger) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), dp(8), dp(12), dp(8));
+        row.setMinimumHeight(dp(64));
+        row.setClickable(true);
+        row.setFocusable(true);
+        row.setTag(action);
+        TextView textBlock = new TextView(this);
+        textBlock.setText(title + "\n" + summary);
+        textBlock.setTextSize(14);
+        textBlock.setTextColor(getColorCompat(danger ? R.color.error : R.color.on_surface));
+        textBlock.setLineSpacing(0, 1.05f);
+        textBlock.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        textBlock.setMaxLines(2);
+        row.addView(textBlock, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView arrow = text("›", getColorCompat(R.color.on_surface_variant));
+        arrow.setTextSize(26);
+        arrow.setGravity(Gravity.CENTER);
+        arrow.setPadding(0, 0, 0, dp(2));
+        row.addView(arrow, new LinearLayout.LayoutParams(dp(32), dp(48)));
+        parent.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        View divider = new View(this);
+        divider.setBackgroundColor(getColorCompat(R.color.outline_variant));
+        LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(-1, 1);
+        dividerParams.setMargins(dp(16), 0, dp(16), 0);
+        parent.addView(divider, dividerParams);
+    }
+
+    private void bindSettingsActions(View view, AlertDialog dialog) {
+        if (!(view instanceof ViewGroup)) return;
+        ViewGroup group = (ViewGroup) view;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            Object tag = child.getTag();
+            if (tag instanceof Runnable) {
+                Runnable action = (Runnable) tag;
+                child.setOnClickListener(ignored -> {
+                    dialog.dismiss();
+                    action.run();
+                });
             }
-        }).show();
+            bindSettingsActions(child, dialog);
+        }
+    }
+
+    private void showPerformanceSettings() {
+        PreviewCache.Stats stats = previewCache.stats();
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(24), dp(4), dp(24), 0);
+        NumberPicker preloadPicker = numberPicker(1, 10, preloadConcurrency,
+                "分页预热并发数");
+        NumberPicker submitPicker = numberPicker(1, 4, submitConcurrency,
+                "批量提交并发数");
+        body.addView(settingRow("分页预热并发数", preloadPicker));
+        body.addView(settingRow("批量提交并发数", submitPicker));
+        TextView cacheInfo = text("缓存 " + stats.fileCount + " 项 · "
+                + Models.formatBytes(stats.totalBytes) + " / "
+                + Models.formatBytes(PreviewCache.DEFAULT_MAX_DISK_BYTES)
+                + " · 内存 " + stats.memoryEntryCount + " 项"
+                + "\n原分辨率解码并发 " + imageWorkerCount + " 路", 0xff505a59);
+        cacheInfo.setPadding(0, dp(12), 0, dp(4));
+        body.addView(cacheInfo);
+        new MaterialAlertDialogBuilder(this).setTitle("性能与缓存")
+                .setView(body)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("保存", (dialog, which) -> {
+                    int previousPreload = preloadConcurrency;
+                    preloadConcurrency = preloadPicker.getValue();
+                    submitConcurrency = submitPicker.getValue();
+                    saveLocalSettings();
+                    if (classificationMode && !busy && previousPreload != preloadConcurrency) {
+                        preloadCurrentPage();
+                    }
+                }).show();
+    }
+
+    private NumberPicker numberPicker(int min, int max, int value, String description) {
+        NumberPicker picker = new NumberPicker(this);
+        picker.setMinValue(min);
+        picker.setMaxValue(max);
+        picker.setValue(value);
+        picker.setWrapSelectorWheel(false);
+        picker.setContentDescription(description);
+        return picker;
+    }
+
+    private LinearLayout settingRow(String label, View control) {
+        LinearLayout row = row();
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = text(label, 0xff171c1b);
+        row.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        row.addView(control, new LinearLayout.LayoutParams(dp(104), dp(96)));
+        return row;
+    }
+
+    private void confirmClearPreviewCache() {
+        if (busy) {
+            showError("当前有任务正在进行，请稍后清理缓存");
+            return;
+        }
+        PreviewCache.Stats stats = previewCache.stats();
+        new MaterialAlertDialogBuilder(this).setTitle("清理预览缓存")
+                .setMessage("将删除 " + stats.fileCount + " 项缓存（"
+                        + Models.formatBytes(stats.totalBytes) + "）。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("清理", (dialog, which) -> clearPreviewCache()).show();
+    }
+
+    private void clearPreviewCache() {
+        ++preloadGeneration;
+        ++cacheGeneration;
+        preloadQueue.clear();
+        if (status != null) status.setText("正在清理预览缓存");
+        try {
+            cacheExecutor.execute(() -> {
+                previewCache.clear();
+                mainHandler.post(() -> {
+                    if (!isFinishing() && !isDestroyed()) {
+                        if (status != null) status.setText("预览缓存已清理");
+                        showInfo("预览缓存已清理");
+                    }
+                });
+            });
+        } catch (RejectedExecutionException error) {
+            showError("缓存任务已停止");
+        }
     }
 
     private void showConnectionDiagnostics() {
@@ -1373,29 +2407,12 @@ public final class MainActivity extends AppCompatActivity {
                 }).show();
     }
 
-    private void openRemote(Models.FileItem item) {
-        if (item.entry.rawUrl.isEmpty()) {
-            setBusy(true, "正在获取视频地址: " + item.entry.name);
-            client.getFileInfo(item.entry.path, (ok, message, entry) -> {
-                setBusy(false, "");
-                if (!ok || entry.rawUrl.isEmpty()) {
-                    showError(ok ? "OpenList 没有返回视频地址。" : message);
-                    return;
-                }
-                item.entry.rawUrl = entry.rawUrl;
-                openRemote(item);
-            });
-            return;
-        }
-        java.net.URL url = OpenListClient.resolveUrl(client.getBaseUrl(), item.entry.rawUrl);
-        if (url == null) {
-            showError("视频地址无效。");
-            return;
-        }
+    private String appVersionName() {
         try {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url.toString())));
-        } catch (ActivityNotFoundException error) {
-            showError("系统没有可用的视频播放器。");
+            android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return info.versionName == null ? "" : info.versionName;
+        } catch (android.content.pm.PackageManager.NameNotFoundException error) {
+            return "";
         }
     }
 
@@ -1431,7 +2448,9 @@ public final class MainActivity extends AppCompatActivity {
         Models.FileItem current = currentIndex >= 0 && currentIndex < files.size()
                 ? files.get(currentIndex) : null;
         if (saveButton != null) saveButton.setEnabled(classificationMode && pending > 0 && !busy);
-        if (sourceBrowseButton != null) sourceBrowseButton.setEnabled(!classificationMode && !busy);
+        if (tagEditButton != null) tagEditButton.setEnabled(!busy);
+        if (sourcePathView != null) sourcePathView.setEnabled(!classificationMode && !busy);
+        if (visiblePathView != null) visiblePathView.setEnabled(!classificationMode && !busy);
         if (downloadCurrentButton != null) downloadCurrentButton.setEnabled(current != null && !busy);
         if (convertCurrentButton != null) convertCurrentButton.setEnabled(current != null && !current.submitted
                 && Models.isImageFileName(current.entry.name) && !busy);
@@ -1472,6 +2491,13 @@ public final class MainActivity extends AppCompatActivity {
                 + (item.lastError.isEmpty() ? "" : "\n错误: " + item.lastError);
     }
 
+    private String formatPreviewInfo(Models.FileItem item) {
+        return "路径: " + item.entry.path + "\n类型: " + Models.fileType(item.entry)
+                + "    大小: " + Models.formatBytes(item.entry.size) + "\n状态: "
+                + Models.statusText(item)
+                + (item.lastError.isEmpty() ? "" : "\n错误: " + item.lastError);
+    }
+
     private void showInfo(String title, String message) {
         new MaterialAlertDialogBuilder(this).setTitle(title).setMessage(message).setPositiveButton("确定", null).show();
     }
@@ -1489,10 +2515,30 @@ public final class MainActivity extends AppCompatActivity {
         final int right = view.getPaddingRight();
         final int bottom = view.getPaddingBottom();
         ViewCompat.setOnApplyWindowInsetsListener(view, (target, windowInsets) -> {
-            Insets bars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());
-            target.setPadding(left + bars.left, top + bars.top,
-                    right + bars.right, bottom + bars.bottom);
+            Insets navigation = windowInsets.getInsets(WindowInsetsCompat.Type.navigationBars());
+            Insets cutout = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout());
+            // Keep the left/right cutout safe area while the page background still reaches the
+            // hidden status-bar edge. This matters on landscape devices with a camera notch.
+            int safeLeft = Math.max(cutout.left, navigation.left);
+            int safeRight = Math.max(cutout.right, navigation.right);
+            target.setPadding(left + safeLeft, top, right + safeRight,
+                    bottom + navigation.bottom);
             return windowInsets;
+        });
+        ViewCompat.requestApplyInsets(view);
+    }
+
+    private void applyCutoutInsets(View view) {
+        final int left = view.getPaddingLeft();
+        final int top = view.getPaddingTop();
+        final int right = view.getPaddingRight();
+        ViewCompat.setOnApplyWindowInsetsListener(view, (target, insets) -> {
+            Insets cutout = insets.getInsets(WindowInsetsCompat.Type.displayCutout());
+            Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
+            target.setPadding(left + Math.max(cutout.left, bars.left),
+                    top + cutout.top,
+                    right + Math.max(cutout.right, bars.right), target.getPaddingBottom());
+            return insets;
         });
         ViewCompat.requestApplyInsets(view);
     }
@@ -1501,12 +2547,24 @@ public final class MainActivity extends AppCompatActivity {
         MaterialPanel value = new MaterialPanel(this);
         value.setCardBackgroundColor(getColorCompat(R.color.surface));
         value.setCardElevation(0);
-        value.setRadius(dp(10));
+        value.setRadius(dp(6));
         value.setStrokeWidth(dp(1));
         value.setStrokeColor(getColorCompat(R.color.outline_variant));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.setMargins(0, dp(10), 0, dp(10));
+        params.setMargins(0, dp(8), 0, dp(8));
         value.setLayoutParams(params);
+        return value;
+    }
+
+    private boolean isCompactLandscape() {
+        return !isWideWorkspace();
+    }
+
+    private LinearLayout topBand() {
+        LinearLayout value = new LinearLayout(this);
+        value.setOrientation(LinearLayout.VERTICAL);
+        value.setBackgroundColor(getColorCompat(R.color.surface));
+        value.setPadding(dp(16), dp(4), dp(16), 0);
         return value;
     }
 
@@ -1522,7 +2580,7 @@ public final class MainActivity extends AppCompatActivity {
         result.setTextSize(size);
         result.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         result.setLetterSpacing(0f);
-        result.setPadding(0, dp(6), 0, dp(10));
+        result.setPadding(0, dp(4), 0, dp(8));
         return result;
     }
 
@@ -1548,7 +2606,15 @@ public final class MainActivity extends AppCompatActivity {
         TextInputLayout value = new TextInputLayout(this);
         value.setHint(label);
         value.setBoxBackgroundMode(TextInputLayout.BOX_BACKGROUND_OUTLINE);
-        value.setBoxCornerRadii(dp(8), dp(8), dp(8), dp(8));
+        value.setBoxCornerRadii(dp(5), dp(5), dp(5), dp(5));
+        if (child instanceof TextView) {
+            TextView field = (TextView) child;
+            CharSequence placeholder = field.getHint();
+            if (placeholder != null && !label.contentEquals(placeholder)) {
+                value.setPlaceholderText(placeholder);
+            }
+            field.setHint(null);
+        }
         if (child.getId() == View.NO_ID) child.setId(View.generateViewId());
         value.addView(child, new LinearLayout.LayoutParams(-1, -2));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
@@ -1563,12 +2629,51 @@ public final class MainActivity extends AppCompatActivity {
         result.setText(label);
         result.setTextColor(getColorCompat(R.color.primary));
         result.setStrokeColor(ColorStateList.valueOf(getColorCompat(R.color.outline_variant)));
+        result.setCornerRadius(dp(5));
         result.setAllCaps(false);
         result.setTextSize(14);
-        result.setMinHeight(dp(44));
-        result.setMinimumHeight(dp(44));
+        result.setMinHeight(dp(48));
+        result.setMinimumHeight(dp(48));
         result.setInsetTop(0);
         result.setInsetBottom(0);
+        return result;
+    }
+
+    private Button iconButton(int drawableRes, String description) {
+        MaterialButton result = new MaterialButton(this);
+        result.setIconResource(drawableRes);
+        result.setIconTint(ColorStateList.valueOf(getColorCompat(R.color.primary)));
+        result.setIconSize(dp(18));
+        result.setIconPadding(0);
+        result.setIconGravity(MaterialButton.ICON_GRAVITY_TEXT_TOP);
+        result.setGravity(Gravity.CENTER);
+        result.setPadding(0, 0, 0, 0);
+        // Keep a stable 48dp touch target while leaving the visual bounds frameless.
+        result.setMinWidth(dp(48));
+        result.setMinimumWidth(dp(48));
+        result.setMinHeight(dp(48));
+        result.setMinimumHeight(dp(48));
+        result.setInsetTop(0);
+        result.setInsetBottom(0);
+        result.setCornerRadius(0);
+        result.setStrokeWidth(0);
+        result.setBackgroundTintList(ColorStateList.valueOf(Color.TRANSPARENT));
+        result.setStrokeColor(ColorStateList.valueOf(Color.TRANSPARENT));
+        result.setElevation(0f);
+        result.setContentDescription(description);
+        return result;
+    }
+
+    private ImageButton compactIconButton(int drawableRes, String description) {
+        ImageButton result = new ImageButton(this);
+        result.setImageResource(drawableRes);
+        result.setImageTintList(ColorStateList.valueOf(getColorCompat(R.color.primary)));
+        result.setScaleType(ImageView.ScaleType.CENTER);
+        result.setPadding(0, 0, 0, 0);
+        result.setMinimumWidth(dp(40));
+        result.setMinimumHeight(dp(40));
+        result.setBackgroundColor(Color.TRANSPARENT);
+        result.setContentDescription(description);
         return result;
     }
 
@@ -1577,10 +2682,11 @@ public final class MainActivity extends AppCompatActivity {
         result.setText(label);
         result.setTextColor(getColorCompat(R.color.on_primary));
         result.setBackgroundTintList(ColorStateList.valueOf(getColorCompat(R.color.primary)));
+        result.setCornerRadius(dp(5));
         result.setAllCaps(false);
         result.setTextSize(14);
-        result.setMinHeight(dp(44));
-        result.setMinimumHeight(dp(44));
+        result.setMinHeight(dp(48));
+        result.setMinimumHeight(dp(48));
         result.setInsetTop(0);
         result.setInsetBottom(0);
         result.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
@@ -1594,6 +2700,82 @@ public final class MainActivity extends AppCompatActivity {
         return result;
     }
 
+    private final class FileListAdapter extends RecyclerView.Adapter<FileListAdapter.Holder> {
+        final class Holder extends RecyclerView.ViewHolder {
+            final MaterialCardView card;
+            final TextView nameLine;
+            final TextView tagLine;
+
+            Holder(MaterialCardView card, TextView nameLine, TextView tagLine) {
+                super(card);
+                this.card = card;
+                this.nameLine = nameLine;
+                this.tagLine = tagLine;
+            }
+        }
+
+        @Override
+        public int getItemCount() {
+            if (!classificationMode || files.isEmpty()) return 0;
+            int start = currentPage * PAGE_SIZE;
+            return Math.min(files.size(), start + PAGE_SIZE) - start;
+        }
+
+        @Override
+        public Holder onCreateViewHolder(ViewGroup parent, int viewType) {
+            MaterialCardView card = new MaterialCardView(MainActivity.this);
+            card.setRadius(dp(4));
+            card.setCardElevation(0);
+            card.setStrokeWidth(dp(1));
+            card.setStrokeColor(getColorCompat(R.color.outline_variant));
+            card.setCardBackgroundColor(getColorCompat(R.color.surface));
+            LinearLayout inner = new LinearLayout(MainActivity.this);
+            inner.setOrientation(LinearLayout.VERTICAL);
+            inner.setPadding(dp(10), dp(8), dp(10), dp(8));
+            TextView nameLine = new TextView(MainActivity.this);
+            nameLine.setTextSize(14);
+            nameLine.setTextColor(getColorCompat(R.color.on_surface));
+            nameLine.setSingleLine(true);
+            nameLine.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            TextView tagLine = new TextView(MainActivity.this);
+            tagLine.setTextSize(12);
+            tagLine.setTextColor(getColorCompat(R.color.on_surface_variant));
+            tagLine.setSingleLine(true);
+            tagLine.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            inner.addView(nameLine);
+            inner.addView(tagLine);
+            card.addView(inner);
+            RecyclerView.LayoutParams params = new RecyclerView.LayoutParams(-1, -2);
+            params.setMargins(0, 0, 0, dp(6));
+            card.setLayoutParams(params);
+            card.setClickable(true);
+            card.setFocusable(true);
+            return new Holder(card, nameLine, tagLine);
+        }
+
+        @Override
+        public void onBindViewHolder(Holder holder, int position) {
+            int fileIndex = currentPage * PAGE_SIZE + position;
+            if (fileIndex >= files.size()) {
+                holder.card.setVisibility(View.INVISIBLE);
+                return;
+            }
+            holder.card.setVisibility(View.VISIBLE);
+            Models.FileItem item = files.get(fileIndex);
+            holder.nameLine.setText((fileIndex + 1) + ". " + Models.statusText(item)
+                    + "  " + item.entry.name);
+            holder.tagLine.setText(item.selectedTags.isEmpty()
+                    ? "" : "标签：" + String.join("、", item.selectedTags));
+            holder.tagLine.setVisibility(item.selectedTags.isEmpty() ? View.GONE : View.VISIBLE);
+            boolean current = fileIndex == currentIndex;
+            holder.card.setStrokeColor(getColorCompat(
+                    current ? R.color.primary : R.color.outline_variant));
+            holder.card.setStrokeWidth(dp(current ? 2 : 1));
+            final int target = fileIndex;
+            holder.card.setOnClickListener(view -> setCurrentIndex(target));
+        }
+    }
+
     private static final class MaterialPanel extends MaterialCardView {
         private final LinearLayout content;
 
@@ -1603,6 +2785,16 @@ public final class MainActivity extends AppCompatActivity {
             content.setOrientation(LinearLayout.VERTICAL);
             content.setPadding(dp(context, 14), dp(context, 12), dp(context, 14), dp(context, 12));
             super.addView(content, new ViewGroup.LayoutParams(-1, -2));
+        }
+
+        void fillHeight() {
+            ViewGroup.LayoutParams params = content.getLayoutParams();
+            params.height = ViewGroup.LayoutParams.MATCH_PARENT;
+            content.setLayoutParams(params);
+        }
+
+        void setInnerPadding(int left, int top, int right, int bottom) {
+            content.setPadding(left, top, right, bottom);
         }
 
         @Override

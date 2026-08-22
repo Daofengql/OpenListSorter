@@ -16,6 +16,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -72,6 +73,33 @@ public final class OpenListClientConnectionTest {
         }
     }
 
+    @Test
+    public void lowPriorityDownloadUsesDedicatedPreloadPool() throws Exception {
+        CountDownLatch callbackSeen = new CountDownLatch(1);
+        AtomicReference<Boolean> callbackOk = new AtomicReference<>();
+        AtomicReference<String> progressThread = new AtomicReference<>("");
+        OpenListClient client = new OpenListClient();
+        try {
+            URL url = new URL("http://127.0.0.1:" + server.getLocalPort() + "/fixture.heic");
+            client.downloadUrl(url, (ok, message, data) -> {
+                callbackOk.set(ok);
+                callbackSeen.countDown();
+            }, (received, total) -> progressThread.compareAndSet("",
+                    Thread.currentThread().getName()), true);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (System.nanoTime() < deadline && callbackSeen.getCount() > 0) {
+                Shadows.shadowOf(Looper.getMainLooper()).idle();
+                Thread.sleep(20L);
+            }
+            assertTrue("download callback was not delivered", callbackSeen.getCount() == 0);
+            assertEquals(Boolean.TRUE, callbackOk.get());
+            assertTrue("download did not use preload pool: " + progressThread.get(),
+                    progressThread.get().startsWith("openlist-preload"));
+        } finally {
+            client.shutdown();
+        }
+    }
+
     private void serveRequests() {
         try {
             for (int requestNumber = 0; requestNumber < 2; requestNumber++) {
@@ -87,7 +115,7 @@ public final class OpenListClientConnectionTest {
                         requestValid.set("token-abc".equals(authorization)
                                 && body.contains("\"path\":")
                                 && body.contains("\"page\":1")
-                                && body.contains("\"per_page\":0"));
+                                && body.contains("\"per_page\":2000"));
                         requestSeen.countDown();
                     }
                     writeJson(socket);

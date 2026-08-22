@@ -65,12 +65,12 @@ public final class MainActivityConnectionTest {
 
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (System.nanoTime() < deadline
-                    && !hasText(activity.findViewById(android.R.id.content), "分类任务")) {
+                    && !field(activity, "mainScreenVisible", Boolean.class)) {
                 Shadows.shadowOf(Looper.getMainLooper()).idle();
                 Thread.sleep(20L);
             }
             assertTrue("successful connection did not replace the connection screen",
-                    hasText(activity.findViewById(android.R.id.content), "分类任务"));
+                    field(activity, "mainScreenVisible", Boolean.class));
         }
     }
 
