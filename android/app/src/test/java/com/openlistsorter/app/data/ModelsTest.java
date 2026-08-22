@@ -2,6 +2,8 @@ package com.openlistsorter.app.data;
 
 import org.junit.Test;
 
+import java.util.Arrays;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -23,6 +25,19 @@ public final class ModelsTest {
         assertTrue(Models.isVideoFileName("clip.MP4"));
         assertFalse(Models.isVideoFileName("clip.txt"));
         assertEquals("jpeg", Models.lowerSuffix("/photos/a.jpeg"));
+    }
+
+    @Test
+    public void customSuffixesForceImageAndVideoRecognition() {
+        Models.configureCustomSuffixes(Arrays.asList("jp", ".cover"),
+                Arrays.asList("stream", ".clip"));
+        assertTrue(Models.isImageFileName("misnamed.jp"));
+        assertTrue(Models.isImageFileName("thumbnail.cover"));
+        assertTrue(Models.isVideoFileName("recording.stream"));
+        assertTrue(Models.isVideoFileName("recording.clip"));
+        assertEquals("video/webm", Models.videoMimeType("movie.webm"));
+        assertEquals("video/x-matroska", Models.videoMimeType("movie.mkv"));
+        Models.configureCustomSuffixes(null, null);
     }
 
     @Test

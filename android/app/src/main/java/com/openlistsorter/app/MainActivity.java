@@ -56,12 +56,14 @@ import com.google.android.material.textfield.TextInputLayout;
 import com.openlistsorter.app.data.ConnectionProfile;
 import com.openlistsorter.app.data.ConnectionStore;
 import com.openlistsorter.app.data.ImageConverter;
+import com.openlistsorter.app.data.MediaTypeStore;
 import com.openlistsorter.app.data.Models;
 import com.openlistsorter.app.data.PreviewCache;
 import com.openlistsorter.app.network.OpenListClient;
 import com.openlistsorter.app.ui.PreviewActivity;
 import com.openlistsorter.app.ui.PreviewSessionStore;
 import com.openlistsorter.app.ui.RemoteDirectoryDialog;
+import com.openlistsorter.app.ui.SettingsActivity;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -74,7 +76,6 @@ import java.util.concurrent.RejectedExecutionException;
 
 public final class MainActivity extends AppCompatActivity {
     private static final int PAGE_SIZE = 20;
-    private static final int MAX_PREVIEW_ITEMS = 200;
     private static final int MAX_PRELOAD_ITEMS = 2;
     private static final long MAX_PRELOAD_BYTES = 32L * 1024L * 1024L;
     private static final int DEFAULT_PRELOAD_CONCURRENCY = 3;
@@ -84,6 +85,7 @@ public final class MainActivity extends AppCompatActivity {
     private static final long DETACHED_BITMAP_RECYCLE_DELAY_MS = 500L;
     private static final int REQUEST_CREATE_DOCUMENT = 1001;
     private static final int REQUEST_PREVIEW = 1002;
+    private static final int REQUEST_SETTINGS = 1003;
     private static final String STATE_MAIN_SCREEN = "main_screen_visible";
     private static final String STATE_ENDPOINT = "connection_endpoint";
     private static final String STATE_AUTH_MODE = "connection_auth_mode";
@@ -307,6 +309,26 @@ public final class MainActivity extends AppCompatActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_SETTINGS) {
+            if (data != null && data.getBooleanExtra(SettingsActivity.EXTRA_LOGOUT, false)) {
+                ConnectionStore.disableAutoLogin(this);
+                profile.autoLogin = false;
+                ++preloadGeneration;
+                client.shutdown();
+                client = new OpenListClient();
+                showConnectionScreen();
+                return;
+            }
+            if (data != null && data.getBooleanExtra(
+                    SettingsActivity.EXTRA_CLEAR_SELECTIONS, false)) {
+                clearAllPendingSelections();
+            }
+            loadLocalSettings();
+            renderFileList();
+            renderCurrentFile();
+            updateStats();
+            return;
+        }
         if (requestCode == REQUEST_PREVIEW) {
             previewActive = false;
             schedulePreviewRenderAfterFullscreen();
@@ -608,6 +630,9 @@ public final class MainActivity extends AppCompatActivity {
                 return;
             }
             profile = requested;
+            // Password login creates a token inside OpenListClient. Keep it available to
+            // full-screen playback, including sessions where credentials are not remembered.
+            profile.token = client.getToken();
             if (profile.rememberMe) {
                 ConnectionStore.save(this, profile);
             } else {
@@ -716,7 +741,11 @@ public final class MainActivity extends AppCompatActivity {
         appBar.addView(titleRow);
         appBar.addView(status, new LinearLayout.LayoutParams(-1, -2));
         root.addView(appBar, new LinearLayout.LayoutParams(-1, -2));
-        more.setOnClickListener(view -> showMoreActions());
+        more.setOnClickListener(view -> {
+            Intent settings = new Intent(this, SettingsActivity.class);
+            settings.putExtra(SettingsActivity.EXTRA_CLASSIFICATION_ACTIVE, classificationMode);
+            startActivityForResult(settings, REQUEST_SETTINGS);
+        });
 
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
@@ -1004,6 +1033,7 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void loadLocalSettings() {
+        MediaTypeStore.load(this);
         android.content.SharedPreferences prefs = getSharedPreferences("task", MODE_PRIVATE);
         sourcePath = Models.normalizeRemotePath(prefs.getString("sourcePath", sourcePath));
         sourcePathView.setText(sourcePath);
@@ -1395,10 +1425,8 @@ public final class MainActivity extends AppCompatActivity {
     private void openPreview() {
         if (currentIndex < 0 || currentIndex >= files.size()) return;
         ArrayList<Models.PreviewItem> viewItems = new ArrayList<>();
-        int start = Math.max(0, currentIndex - MAX_PREVIEW_ITEMS / 2);
-        int end = Math.min(files.size(), start + MAX_PREVIEW_ITEMS);
-        start = Math.max(0, end - MAX_PREVIEW_ITEMS);
-        for (int i = start; i < end; i++) {
+        int start = 0;
+        for (int i = 0; i < files.size(); i++) {
             Models.FileItem item = files.get(i);
             Models.PreviewItem preview = new Models.PreviewItem(item.entry);
             preview.selectedTags.addAll(item.selectedTags);
@@ -1409,6 +1437,8 @@ public final class MainActivity extends AppCompatActivity {
         activePreviewSessionId = PreviewSessionStore.create(
                 viewItems, tagNames(), currentIndex - start);
         intent.putExtra(PreviewActivity.EXTRA_SESSION_ID, activePreviewSessionId);
+        intent.putExtra(PreviewActivity.EXTRA_TOKEN, client.getToken());
+        intent.putExtra(PreviewActivity.EXTRA_ENDPOINT, client.getBaseUrl());
         previewActive = true;
         ++cacheGeneration;
         imageView.setImageDrawable(null);

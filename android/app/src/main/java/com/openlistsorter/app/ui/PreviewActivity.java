@@ -32,6 +32,13 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
+import androidx.media3.datasource.DefaultHttpDataSource;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.ui.PlayerView;
 
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.card.MaterialCardView;
@@ -43,6 +50,7 @@ import com.openlistsorter.app.data.ConnectionProfile;
 import com.openlistsorter.app.data.ConnectionStore;
 import com.openlistsorter.app.data.ImageConverter;
 import com.openlistsorter.app.data.Models;
+import com.openlistsorter.app.data.MediaTypeStore;
 import com.openlistsorter.app.data.PreviewCache;
 import com.openlistsorter.app.network.OpenListClient;
 
@@ -58,6 +66,8 @@ public final class PreviewActivity extends Activity {
     public static final String EXTRA_INDEX = "index";
     public static final String EXTRA_TAGS = "tags";
     public static final String EXTRA_SESSION_ID = "preview_session_id";
+    public static final String EXTRA_TOKEN = "preview_token";
+    public static final String EXTRA_ENDPOINT = "preview_endpoint";
     public static final String EXTRA_RESULT_ITEMS = "result_items";
     public static final String EXTRA_RESULT_PATH = "result_path";
     private static final int REQUEST_CREATE_DOCUMENT = 3101;
@@ -81,7 +91,8 @@ public final class PreviewActivity extends Activity {
     private MaterialButton prevButton;
     private MaterialButton nextButton;
     private ZoomImageView imageView;
-    private ImageView videoView;
+    private PlayerView videoView;
+    private ExoPlayer videoPlayer;
     private LinearLayout progressHost;
     private TextView errorView;
     private MaterialButton tagToggle;
@@ -96,12 +107,16 @@ public final class PreviewActivity extends Activity {
     private ArrayList<String> tagNames = new ArrayList<>();
     private volatile int loadingGeneration;
     private String sessionId;
+    private String sessionToken = "";
+    private String sessionEndpoint = "";
     private int previewDecodeLimit = 1536;
     private volatile boolean resourcesReleased;
     private volatile boolean exiting;
     private boolean updatingTagChecks;
     private boolean resultSent;
     private boolean actionBusy;
+    private int videoRetryTarget = -1;
+    private boolean videoRetrying;
     private byte[] pendingDownloadData;
     private String pendingDownloadName;
     private Insets overlaySafeInsets = Insets.NONE;
@@ -144,10 +159,16 @@ public final class PreviewActivity extends Activity {
         client = new OpenListClient();
         previewCache = new PreviewCache(this);
         ConnectionProfile profile = ConnectionStore.load(this);
-        client.setBaseUrl(profile.endpoint);
-        client.setToken(profile.token);
+        MediaTypeStore.load(this);
 
         sessionId = getIntent().getStringExtra(EXTRA_SESSION_ID);
+        sessionToken = getIntent().getStringExtra(EXTRA_TOKEN);
+        if (sessionToken == null) sessionToken = "";
+        sessionEndpoint = getIntent().getStringExtra(EXTRA_ENDPOINT);
+        if (sessionEndpoint == null || sessionEndpoint.isEmpty()) sessionEndpoint = profile.endpoint;
+        if (sessionToken.isEmpty()) sessionToken = profile.token;
+        client.setBaseUrl(sessionEndpoint);
+        client.setToken(sessionToken);
         PreviewSessionStore.Session session = PreviewSessionStore.peek(sessionId);
         if (session != null) {
             items = session.items;
@@ -219,12 +240,12 @@ public final class PreviewActivity extends Activity {
         imageHost.addView(imageView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        videoView = new ImageView(this);
-        videoView.setImageResource(android.R.drawable.ic_media_play);
+        videoView = new PlayerView(this);
+        videoView.setUseController(true);
+        videoView.setControllerAutoShow(true);
         videoView.setBackgroundColor(0x1a000000);
-        videoView.setContentDescription("在外部播放器中打开视频");
+        videoView.setContentDescription("视频播放器，支持拖动进度");
         videoView.setVisibility(View.GONE);
-        videoView.setOnClickListener(v -> openVideo());
         imageHost.addView(videoView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -341,8 +362,6 @@ public final class PreviewActivity extends Activity {
                 move(-1);
             }
         });
-        videoView.setOnTouchListener((v, event) -> fling.onTouchEvent(event));
-
         root.addView(topBar, new LinearLayout.LayoutParams(-1, dp(56)));
         root.addView(imageHost, new LinearLayout.LayoutParams(-1, 0, 1));
         applyTopBarInsets(topBar);
@@ -713,9 +732,13 @@ public final class PreviewActivity extends Activity {
         nextButton.setEnabled(index < items.size() - 1);
         imageView.setImageDrawable(null);
         imageView.setVisibility(View.GONE);
+        releaseVideoPlayer();
         videoView.setVisibility(View.GONE);
         if (item.isVideo) {
             videoView.setVisibility(View.VISIBLE);
+            videoRetryTarget = -1;
+            videoRetrying = false;
+            prepareVideo(index);
         } else {
             loadImage(index);
         }
@@ -954,33 +977,129 @@ public final class PreviewActivity extends Activity {
         errorView = null;
     }
 
-    private void openVideo() {
+    private void prepareVideo(int target) {
+        if (exiting || resourcesReleased || target != index) return;
         Models.RemoteEntry entry = entries.get(index);
         java.net.URL url = OpenListClient.resolveUrl(client.getBaseUrl(), entry.rawUrl);
         if (url == null) {
             progressHost.setVisibility(View.VISIBLE);
             client.getFileInfo(entry.path, (ok, message, fetched) -> {
                 progressHost.setVisibility(View.GONE);
-                if (ok && !fetched.rawUrl.isEmpty()) {
+                if (ok && !fetched.rawUrl.isEmpty() && target == index) {
                     entry.rawUrl = fetched.rawUrl;
                     items.get(index).rawUrl = fetched.rawUrl;
                     java.net.URL resolved = OpenListClient.resolveUrl(client.getBaseUrl(), fetched.rawUrl);
-                    if (resolved != null) startExternal(resolved.toString());
+                    if (resolved != null) startVideoPlayback(target, entry, resolved);
                 } else if (titleView != null) {
                     titleView.setText(ok ? "OpenList 没有返回视频地址" : message);
                 }
             });
             return;
         }
-        startExternal(url.toString());
+        startVideoPlayback(target, entry, url);
     }
 
-    private void startExternal(String url) {
-        try {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-        } catch (ActivityNotFoundException error) {
-            showError(entries.get(index), "系统没有可用的视频播放器。");
+    private void startVideoPlayback(int target, Models.RemoteEntry entry, java.net.URL url) {
+        if (target != index || exiting || resourcesReleased) return;
+        releaseVideoPlayer();
+        DefaultHttpDataSource.Factory httpFactory = new DefaultHttpDataSource.Factory()
+                .setConnectTimeoutMs(10_000)
+                .setReadTimeoutMs(30_000)
+                .setAllowCrossProtocolRedirects(true);
+        java.util.HashMap<String, String> requestHeaders = new java.util.HashMap<>();
+        requestHeaders.put("Accept", "video/*,application/octet-stream;q=0.9,*/*;q=0.5");
+        requestHeaders.put("User-Agent", "OpenListSorter/1.0");
+        String token = sessionToken;
+        if (token.isEmpty()) token = ConnectionStore.load(this).token;
+        if (!token.isEmpty() && sameOrigin(url, client.getBaseUrl())) {
+            requestHeaders.put("Authorization", token);
         }
+        httpFactory.setDefaultRequestProperties(requestHeaders);
+        ExoPlayer player = new ExoPlayer.Builder(this)
+                .setMediaSourceFactory(new DefaultMediaSourceFactory(httpFactory))
+                .build();
+        videoPlayer = player;
+        videoView.setPlayer(player);
+        player.addListener(new Player.Listener() {
+            @Override
+            public void onPlaybackStateChanged(int playbackState) {
+                if (target != index) return;
+                if (playbackState == Player.STATE_READY) progressHost.setVisibility(View.GONE);
+            }
+
+            @Override
+            public void onPlayerError(PlaybackException error) {
+                if (target != index) return;
+                progressHost.setVisibility(View.GONE);
+                if (!videoRetrying && videoRetryTarget != target) {
+                    videoRetryTarget = target;
+                    retryVideoUrl(target, entry);
+                    return;
+                }
+                Throwable cause = error;
+                while (cause.getCause() != null) cause = cause.getCause();
+                String detail = error.getErrorCodeName();
+                if (cause.getMessage() != null && !cause.getMessage().isEmpty()) {
+                    detail += "\n" + cause.getMessage();
+                }
+                showError(entry, "视频解码或读取失败: " + detail);
+            }
+        });
+        MediaItem.Builder mediaItem = new MediaItem.Builder().setUri(url.toString());
+        String mimeType = Models.videoMimeType(entry.name);
+        if (!mimeType.isEmpty()) mediaItem.setMimeType(mimeType);
+        progressHost.setVisibility(View.VISIBLE);
+        player.setMediaItem(mediaItem.build());
+        player.prepare();
+        player.play();
+    }
+
+    private void retryVideoUrl(int target, Models.RemoteEntry entry) {
+        videoRetrying = true;
+        progressHost.setVisibility(View.VISIBLE);
+        client.getFileInfo(entry.path, (ok, message, fetched) -> {
+            if (exiting || resourcesReleased || target != index) return;
+            videoRetrying = false;
+            if (!ok || fetched.rawUrl == null || fetched.rawUrl.isEmpty()) {
+                progressHost.setVisibility(View.GONE);
+                showError(entry, "视频地址刷新失败: " + message);
+                return;
+            }
+            entry.rawUrl = fetched.rawUrl;
+            items.get(target).rawUrl = fetched.rawUrl;
+            java.net.URL freshUrl = OpenListClient.resolveUrl(client.getBaseUrl(), fetched.rawUrl);
+            if (freshUrl == null) {
+                progressHost.setVisibility(View.GONE);
+                showError(entry, "OpenList 返回的视频地址无效。");
+                return;
+            }
+            startVideoPlayback(target, entry, freshUrl);
+        });
+    }
+
+    private boolean sameOrigin(java.net.URL url, String baseUrl) {
+        try {
+            java.net.URI left = url.toURI();
+            java.net.URI right = new java.net.URI(baseUrl);
+            int leftPort = left.getPort() >= 0 ? left.getPort() : defaultPort(left.getScheme());
+            int rightPort = right.getPort() >= 0 ? right.getPort() : defaultPort(right.getScheme());
+            return left.getScheme().equalsIgnoreCase(right.getScheme())
+                    && left.getHost().equalsIgnoreCase(right.getHost())
+                    && leftPort == rightPort;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private int defaultPort(String scheme) {
+        return "https".equalsIgnoreCase(scheme) ? 443 : 80;
+    }
+
+    private void releaseVideoPlayer() {
+        if (videoPlayer == null) return;
+        videoView.setPlayer(null);
+        videoPlayer.release();
+        videoPlayer = null;
     }
 
     private void move(int delta) {
@@ -1049,7 +1168,7 @@ public final class PreviewActivity extends Activity {
         // releasing the cache. This prevents a full-size decoded image from surviving the
         // transition back to MainActivity.
         if (imageView != null) imageView.setImageDrawable(null);
-        if (videoView != null) videoView.setImageDrawable(null);
+        releaseVideoPlayer();
         // The executor's final task recycles the detached cache after any native decode returns
         // and after the renderer has had a short grace period to finish the exit transition.
     }
@@ -1066,7 +1185,7 @@ public final class PreviewActivity extends Activity {
         cancelQueuedImageWork();
         if (progressHost != null) progressHost.setVisibility(View.GONE);
         if (imageView != null) imageView.setImageDrawable(null);
-        if (videoView != null) videoView.setImageDrawable(null);
+        releaseVideoPlayer();
         mainHandler.removeCallbacks(persistRunnable);
         persistSessionNow();
         Intent result = new Intent();
@@ -1103,6 +1222,20 @@ public final class PreviewActivity extends Activity {
     protected void onDestroy() {
         releaseImageResources();
         super.onDestroy();
+    }
+
+    @Override
+    protected void onPause() {
+        if (videoPlayer != null) videoPlayer.pause();
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (videoPlayer != null && videoView.getVisibility() == View.VISIBLE) {
+            videoPlayer.play();
+        }
     }
 
     @Override

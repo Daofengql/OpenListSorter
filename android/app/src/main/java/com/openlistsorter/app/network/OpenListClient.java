@@ -118,6 +118,10 @@ public final class OpenListClient {
         token = value == null ? "" : value.trim();
     }
 
+    public String getToken() {
+        return token;
+    }
+
     public void clearConnection() {
         baseUrl = "";
         token = "";

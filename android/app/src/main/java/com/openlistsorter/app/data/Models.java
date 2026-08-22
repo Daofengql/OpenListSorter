@@ -8,8 +8,14 @@ import org.json.JSONObject;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 
 public final class Models {
+    private static volatile Set<String> customImageSuffixes = Collections.emptySet();
+    private static volatile Set<String> customVideoSuffixes = Collections.emptySet();
     private Models() {
     }
 
@@ -126,7 +132,9 @@ public final class Models {
 
     public static boolean isImageFileName(String name) {
         String suffix = lowerSuffix(name);
-        return suffix.equals("jpg") || suffix.equals("jpeg") || suffix.equals("png")
+        if (customVideoSuffixes.contains(suffix)) return false;
+        return customImageSuffixes.contains(suffix)
+                || suffix.equals("jpg") || suffix.equals("jpeg") || suffix.equals("png")
                 || suffix.equals("gif") || suffix.equals("bmp") || suffix.equals("webp")
                 || suffix.equals("tif") || suffix.equals("tiff") || suffix.equals("heic")
                 || suffix.equals("heif") || suffix.equals("avif") || suffix.equals("ico")
@@ -138,9 +146,50 @@ public final class Models {
 
     public static boolean isVideoFileName(String name) {
         String suffix = lowerSuffix(name);
-        return suffix.equals("mp4") || suffix.equals("mkv") || suffix.equals("mov")
+        if (customImageSuffixes.contains(suffix)) return false;
+        return customVideoSuffixes.contains(suffix)
+                || suffix.equals("mp4") || suffix.equals("mkv") || suffix.equals("mov")
                 || suffix.equals("avi") || suffix.equals("webm") || suffix.equals("flv")
-                || suffix.equals("wmv") || suffix.equals("m4v") || suffix.equals("ts");
+                || suffix.equals("wmv") || suffix.equals("m4v") || suffix.equals("ts")
+                || suffix.equals("m2ts") || suffix.equals("mts") || suffix.equals("ogv")
+                || suffix.equals("ogg") || suffix.equals("3gp") || suffix.equals("3g2")
+                || suffix.equals("mpeg") || suffix.equals("mpg") || suffix.equals("f4v");
+    }
+
+    public static void configureCustomSuffixes(Collection<String> imageSuffixes,
+                                                Collection<String> videoSuffixes) {
+        customImageSuffixes = normalizedSuffixes(imageSuffixes);
+        customVideoSuffixes = normalizedSuffixes(videoSuffixes);
+    }
+
+    public static Set<String> normalizedSuffixes(Collection<String> values) {
+        HashSet<String> result = new HashSet<>();
+        if (values == null) return result;
+        for (String value : values) {
+            if (value == null) continue;
+            String suffix = value.trim().toLowerCase(Locale.US);
+            while (suffix.startsWith(".")) suffix = suffix.substring(1);
+            if (!suffix.isEmpty() && suffix.matches("[a-z0-9]+")) result.add(suffix);
+        }
+        return result;
+    }
+
+    public static String videoMimeType(String name) {
+        String suffix = lowerSuffix(name);
+        if (suffix.equals("webm") || suffix.equals("ogv") || suffix.equals("ogg")) {
+            return suffix.equals("webm") ? "video/webm" : "video/ogg";
+        }
+        if (suffix.equals("mkv")) return "video/x-matroska";
+        if (suffix.equals("mov")) return "video/quicktime";
+        if (suffix.equals("ts") || suffix.equals("mts") || suffix.equals("m2ts")) {
+            return "video/mp2t";
+        }
+        if (suffix.equals("3gp") || suffix.equals("3g2")) return "video/3gpp";
+        if (suffix.equals("mp4") || suffix.equals("m4v") || suffix.equals("f4v")) {
+            return "video/mp4";
+        }
+        if (suffix.equals("avi")) return "video/avi";
+        return "";
     }
 
     public static String formatBytes(long bytes) {
