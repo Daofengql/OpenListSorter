@@ -76,7 +76,6 @@ import java.util.concurrent.RejectedExecutionException;
 
 public final class MainActivity extends AppCompatActivity {
     private static final int PAGE_SIZE = 20;
-    private static final int MAX_PRELOAD_ITEMS = 2;
     private static final long MAX_PRELOAD_BYTES = 32L * 1024L * 1024L;
     private static final int DEFAULT_PRELOAD_CONCURRENCY = 3;
     private static final int DEFAULT_SUBMIT_CONCURRENCY = 2;
@@ -324,6 +323,9 @@ public final class MainActivity extends AppCompatActivity {
                 clearAllPendingSelections();
             }
             loadLocalSettings();
+            // SettingsActivity may have changed the disk cache limit. Recreate the cache so the
+            // current main screen starts using the new limit immediately.
+            if (previewCache != null) previewCache = new PreviewCache(this);
             renderFileList();
             renderCurrentFile();
             updateStats();
@@ -1108,7 +1110,6 @@ public final class MainActivity extends AppCompatActivity {
                 return;
             }
             setCurrentIndex(0);
-            preloadCurrentPage();
         });
     }
 
@@ -1151,7 +1152,9 @@ public final class MainActivity extends AppCompatActivity {
         refreshTags();
         updateStats();
         renderCurrentFile();
-        if (pageChanged) preloadCurrentPage();
+        // Rebuild the look-ahead queue even within the same page so it follows the
+        // file the user actually selected, not the first item of that page.
+        preloadCurrentPage();
     }
 
     private void setPage(int page) {
@@ -1172,8 +1175,12 @@ public final class MainActivity extends AppCompatActivity {
         preloadQueue.clear();
         preloadActiveCount = 0;
         preloadCompletedCount = 0;
-        for (int index = currentPage * PAGE_SIZE; index < pageEnd()
-                && preloadQueue.size() < MAX_PRELOAD_ITEMS; index++) {
+        int firstCandidate = currentIndex >= 0 ? currentIndex + 1 : currentPage * PAGE_SIZE;
+        // The setting controls both the number of look-ahead items and the worker concurrency.
+        // Keep one source of truth instead of silently limiting the queue to a fixed count.
+        int preloadLimit = Math.max(1, preloadConcurrency);
+        for (int index = firstCandidate; index < files.size()
+                && preloadQueue.size() < preloadLimit; index++) {
             Models.RemoteEntry entry = files.get(index).entry;
             if (Models.isImageFileName(entry.name) && entry.size <= MAX_PRELOAD_BYTES) {
                 preloadQueue.add(index);
@@ -1440,7 +1447,9 @@ public final class MainActivity extends AppCompatActivity {
         intent.putExtra(PreviewActivity.EXTRA_TOKEN, client.getToken());
         intent.putExtra(PreviewActivity.EXTRA_ENDPOINT, client.getBaseUrl());
         previewActive = true;
-        ++cacheGeneration;
+        // Keep in-flight preloads alive so they can populate the cache shared with the
+        // fullscreen preview Activity. Invalidating this generation here made the next image
+        // download again even when a preload had already completed.
         imageView.setImageDrawable(null);
         try {
             startActivityForResult(intent, REQUEST_PREVIEW);
@@ -2077,23 +2086,34 @@ public final class MainActivity extends AppCompatActivity {
         Models.FileItem item = files.get(currentIndex);
         setBusy(true, "正在下载 " + item.entry.name);
         fetchFileData(item, (ok, message, data) -> {
-            setBusy(false, "");
             if (!ok) {
+                setBusy(false, "");
                 showError("下载失败: " + message);
                 return;
             }
-            pendingDownloadData = data;
-            pendingDownloadName = item.entry.name;
-            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            intent.setType("application/octet-stream");
-            intent.putExtra(Intent.EXTRA_TITLE, item.entry.name);
+            String name = item.entry.name;
             try {
-                startActivityForResult(intent, REQUEST_CREATE_DOCUMENT);
-            } catch (ActivityNotFoundException error) {
-                pendingDownloadData = null;
-                pendingDownloadName = null;
-                showError("系统没有可用的文件保存界面。");
+                cacheExecutor.execute(() -> {
+                    String savedLocation = "";
+                    String errorMessage = "";
+                    try {
+                        savedLocation = com.openlistsorter.app.data.DownloadSaver.save(
+                                this, name, data);
+                    } catch (IOException | RuntimeException failure) {
+                        errorMessage = "保存失败: " + failure.getMessage();
+                    }
+                    String finalLocation = savedLocation;
+                    String finalError = errorMessage;
+                    mainHandler.post(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        setBusy(false, "");
+                        if (finalError.isEmpty()) showInfo("已保存到" + finalLocation + ": " + name);
+                        else showError(finalError);
+                    });
+                });
+            } catch (RejectedExecutionException error) {
+                setBusy(false, "");
+                showError("后台保存任务已停止，请重试。");
             }
         }, "正在下载 " + item.entry.name);
     }
@@ -2306,7 +2326,7 @@ public final class MainActivity extends AppCompatActivity {
         body.addView(settingRow("批量提交并发数", submitPicker));
         TextView cacheInfo = text("缓存 " + stats.fileCount + " 项 · "
                 + Models.formatBytes(stats.totalBytes) + " / "
-                + Models.formatBytes(PreviewCache.DEFAULT_MAX_DISK_BYTES)
+                + Models.formatBytes(previewCache.maxDiskBytes())
                 + " · 内存 " + stats.memoryEntryCount + " 项"
                 + "\n原分辨率解码并发 " + imageWorkerCount + " 路", 0xff505a59);
         cacheInfo.setPadding(0, dp(12), 0, dp(4));

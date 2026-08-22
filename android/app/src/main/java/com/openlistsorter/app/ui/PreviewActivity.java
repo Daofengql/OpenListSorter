@@ -2,30 +2,29 @@ package com.openlistsorter.app.ui;
 
 import android.app.Activity;
 import android.app.ActivityManager;
-import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
-import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.GridLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.io.IOException;
-import java.io.OutputStream;
+import java.util.HashSet;
+import java.util.Set;
 
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
@@ -55,6 +54,8 @@ import com.openlistsorter.app.data.PreviewCache;
 import com.openlistsorter.app.network.OpenListClient;
 
 import java.util.ArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -70,17 +71,18 @@ public final class PreviewActivity extends Activity {
     public static final String EXTRA_ENDPOINT = "preview_endpoint";
     public static final String EXTRA_RESULT_ITEMS = "result_items";
     public static final String EXTRA_RESULT_PATH = "result_path";
-    private static final int REQUEST_CREATE_DOCUMENT = 3101;
     private static final String STATE_TAG_PANEL_POSITIONED = "tag_panel_positioned";
     private static final String STATE_TAG_PANEL_RIGHT = "tag_panel_right";
     private static final String STATE_TAG_PANEL_LEFT = "tag_panel_left";
     private static final String STATE_TAG_PANEL_TOP = "tag_panel_top";
     private static final long DETACHED_BITMAP_RECYCLE_DELAY_MS = 500L;
+    private static final long TOP_BAR_HIDE_DELAY_MS = 2600L;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private OpenListClient client;
     private PreviewCache previewCache;
     private ThreadPoolExecutor imageExecutor;
+    private ExecutorService prefetchWriteExecutor;
 
     private ArrayList<Models.PreviewItem> items = new ArrayList<>();
     private final ArrayList<Models.RemoteEntry> entries = new ArrayList<>();
@@ -88,6 +90,7 @@ public final class PreviewActivity extends Activity {
 
     private TextView titleView;
     private TextView counterView;
+    private LinearLayout topBar;
     private MaterialButton prevButton;
     private MaterialButton nextButton;
     private ZoomImageView imageView;
@@ -97,10 +100,12 @@ public final class PreviewActivity extends Activity {
     private TextView errorView;
     private MaterialButton tagToggle;
     private MaterialCardView tagPanel;
-    private LinearLayout tagGroup;
+    private GridLayout tagGroup;
     private MaterialButton downloadAction;
     private MaterialButton convertAction;
     private MaterialButton deleteAction;
+    private MaterialButton actionPreviousButton;
+    private MaterialButton actionNextButton;
     private FrameLayout overlayHost;
     private FrameLayout imageHost;
     private View actionRow;
@@ -110,6 +115,7 @@ public final class PreviewActivity extends Activity {
     private String sessionToken = "";
     private String sessionEndpoint = "";
     private int previewDecodeLimit = 1536;
+    private int preloadConcurrency = 3;
     private volatile boolean resourcesReleased;
     private volatile boolean exiting;
     private boolean updatingTagChecks;
@@ -117,8 +123,7 @@ public final class PreviewActivity extends Activity {
     private boolean actionBusy;
     private int videoRetryTarget = -1;
     private boolean videoRetrying;
-    private byte[] pendingDownloadData;
-    private String pendingDownloadName;
+    private final Set<String> prefetchInFlight = new HashSet<>();
     private Insets overlaySafeInsets = Insets.NONE;
     private boolean tagPanelPositioned;
     private boolean tagPanelDockedRight = true;
@@ -130,6 +135,7 @@ public final class PreviewActivity extends Activity {
     private int tagDragStartLeft;
     private int tagDragStartTop;
     private final Runnable persistRunnable = this::persistSessionNow;
+    private final Runnable hideTopBarRunnable = this::hideTopBar;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -156,6 +162,11 @@ public final class PreviewActivity extends Activity {
                     thread.setPriority(Thread.NORM_PRIORITY - 1);
                     return thread;
                 });
+        prefetchWriteExecutor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "preview-prefetch-cache");
+            thread.setPriority(Thread.NORM_PRIORITY - 2);
+            return thread;
+        });
         client = new OpenListClient();
         previewCache = new PreviewCache(this);
         ConnectionProfile profile = ConnectionStore.load(this);
@@ -169,6 +180,9 @@ public final class PreviewActivity extends Activity {
         if (sessionToken.isEmpty()) sessionToken = profile.token;
         client.setBaseUrl(sessionEndpoint);
         client.setToken(sessionToken);
+        preloadConcurrency = Math.max(1, Math.min(10,
+                getSharedPreferences("task", MODE_PRIVATE)
+                        .getInt("preloadConcurrency", 3)));
         PreviewSessionStore.Session session = PreviewSessionStore.peek(sessionId);
         if (session != null) {
             items = session.items;
@@ -198,7 +212,7 @@ public final class PreviewActivity extends Activity {
         overlayHost.addView(root, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        LinearLayout topBar = new LinearLayout(this);
+        topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
         topBar.setBackgroundColor(0xff1b211f);
@@ -230,13 +244,15 @@ public final class PreviewActivity extends Activity {
         topBar.addView(nextButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
         prevButton.setOnClickListener(v -> move(-1));
         nextButton.setOnClickListener(v -> move(1));
+        topBar.setOnClickListener(v -> showTopBarTemporarily());
 
         imageHost = new FrameLayout(this);
         imageHost.setBackgroundColor(0xff101413);
 
         imageView = new ZoomImageView(this);
         imageView.setBackgroundColor(0xff101413);
-        imageView.setContentDescription("全屏图片预览，双指缩放，拖动查看，双击复位");
+        imageView.setContentDescription("全屏图片预览，双指缩放，拖动查看，双击复位，单击显示或隐藏顶栏");
+        imageView.setTapListener(this::toggleTopBar);
         imageHost.addView(imageView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -265,7 +281,7 @@ public final class PreviewActivity extends Activity {
         progressParams.setMargins(dp(8), dp(8), dp(8), 0);
         imageHost.addView(progressHost, progressParams);
 
-        tagToggle = iconButton(android.R.drawable.ic_menu_edit, "展开标签选择");
+        tagToggle = compactIconButton(android.R.drawable.ic_menu_edit, "展开标签选择");
         tagToggle.setOnClickListener(v -> {
             boolean expanded = tagPanel.getVisibility() == View.VISIBLE;
             tagPanel.setVisibility(expanded ? View.GONE : View.VISIBLE);
@@ -277,54 +293,61 @@ public final class PreviewActivity extends Activity {
                 });
             }
         });
-        FrameLayout.LayoutParams tagToggleParams = new FrameLayout.LayoutParams(
-                dp(52), dp(52), Gravity.BOTTOM | Gravity.END);
-        tagToggleParams.setMargins(0, 0, dp(16), dp(20));
-        imageHost.addView(tagToggle, tagToggleParams);
-
         LinearLayout actionRow = new LinearLayout(this);
         this.actionRow = actionRow;
         actionRow.setOrientation(LinearLayout.VERTICAL);
         actionRow.setGravity(Gravity.CENTER_VERTICAL);
         actionRow.setPadding(0, dp(2), 0, dp(2));
+        actionPreviousButton = compactIconButton(android.R.drawable.ic_media_previous, "上一张");
+        actionNextButton = compactIconButton(android.R.drawable.ic_media_next, "下一张");
         downloadAction = compactIconButton(android.R.drawable.ic_menu_save, "下载当前文件");
         convertAction = compactIconButton(android.R.drawable.ic_menu_manage, "转换当前图片为 WebP");
         deleteAction = compactIconButton(android.R.drawable.ic_menu_delete, "删除当前文件");
         styleFullscreenActionButton(downloadAction, Color.WHITE);
         styleFullscreenActionButton(convertAction, Color.WHITE);
         styleFullscreenActionButton(deleteAction, 0xffff8a80);
+        styleFullscreenActionButton(tagToggle, Color.WHITE);
+        styleFullscreenActionButton(actionPreviousButton, Color.WHITE);
+        styleFullscreenActionButton(actionNextButton, Color.WHITE);
+        actionPreviousButton.setOnClickListener(v -> move(-1));
+        actionNextButton.setOnClickListener(v -> move(1));
         downloadAction.setOnClickListener(v -> downloadCurrent());
         convertAction.setOnClickListener(v -> convertCurrent());
         deleteAction.setOnClickListener(v -> deleteCurrent());
-        actionRow.addView(downloadAction, new LinearLayout.LayoutParams(dp(36), dp(36)));
-        actionRow.addView(convertAction, new LinearLayout.LayoutParams(dp(36), dp(36)));
-        actionRow.addView(deleteAction, new LinearLayout.LayoutParams(dp(36), dp(36)));
+        actionRow.addView(actionPreviousButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        actionRow.addView(downloadAction, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        actionRow.addView(convertAction, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        actionRow.addView(deleteAction, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        actionRow.addView(tagToggle, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        actionRow.addView(actionNextButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
         FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(
-                dp(36), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_VERTICAL | Gravity.END);
+                dp(44), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_VERTICAL | Gravity.END);
         actionParams.setMargins(0, 0, dp(16), 0);
         imageHost.addView(actionRow, actionParams);
 
         tagPanel = new MaterialCardView(this);
         tagPanel.setCardBackgroundColor(0xf21b211f);
-        tagPanel.setRadius(dp(10));
+        tagPanel.setRadius(dp(8));
         tagPanel.setVisibility(View.GONE);
         LinearLayout tagContent = new LinearLayout(this);
         tagContent.setOrientation(LinearLayout.VERTICAL);
-        tagContent.setPadding(dp(10), dp(2), dp(10), dp(4));
+        tagContent.setPadding(dp(8), dp(2), dp(8), dp(4));
         View tagDragHandle = new View(this);
         tagDragHandle.setContentDescription("拖动标签面板");
         tagDragHandle.setBackgroundColor(0x33111111);
         tagDragHandle.setOnTouchListener((view, event) -> handleTagPanelTouch(event));
-        tagContent.addView(tagDragHandle, new LinearLayout.LayoutParams(-1, dp(32)));
+        tagDragHandle.setOnClickListener(v -> showTopBarTemporarily());
+        tagContent.addView(tagDragHandle, new LinearLayout.LayoutParams(-1, dp(24)));
         ScrollView tagScroll = new ScrollView(this);
         tagScroll.setClipToPadding(false);
-        tagGroup = new LinearLayout(this);
-        tagGroup.setOrientation(LinearLayout.VERTICAL);
+        tagGroup = new GridLayout(this);
+        tagGroup.setColumnCount(2);
+        tagGroup.setUseDefaultMargins(false);
         tagScroll.addView(tagGroup, new ScrollView.LayoutParams(-1, -2));
         tagContent.addView(tagScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         tagPanel.addView(tagContent);
         FrameLayout.LayoutParams tagPanelParams = new FrameLayout.LayoutParams(
-                dp(280), dp(224), Gravity.BOTTOM | Gravity.END);
+                dp(240), dp(176), Gravity.BOTTOM | Gravity.END);
         tagPanelParams.setMargins(0, 0, dp(16), dp(78));
         overlayHost.addView(tagPanel, tagPanelParams);
         // The card background and drag strip move the panel; child checkboxes and the ScrollView
@@ -342,40 +365,21 @@ public final class PreviewActivity extends Activity {
             return windowInsets;
         });
 
-        GestureDetector fling = new GestureDetector(this,
-                new GestureDetector.SimpleOnGestureListener() {
-                    @Override
-                    public boolean onFling(MotionEvent e1, MotionEvent e2, float vx, float vy) {
-                        if (Math.abs(vx) < Math.abs(vy) || Math.abs(vx) < dp(120)) return false;
-                        move(vx < 0 ? 1 : -1);
-                        return true;
-                    }
-                });
-        imageView.setSwipeListener(new ZoomImageView.SwipeListener() {
-            @Override
-            public void onSwipeLeft() {
-                move(1);
-            }
-
-            @Override
-            public void onSwipeRight() {
-                move(-1);
-            }
-        });
         root.addView(topBar, new LinearLayout.LayoutParams(-1, dp(56)));
         root.addView(imageHost, new LinearLayout.LayoutParams(-1, 0, 1));
         applyTopBarInsets(topBar);
         setContentView(overlayHost);
         ViewCompat.requestApplyInsets(overlayHost);
+        showTopBarTemporarily();
     }
 
     private MaterialButton compactIconButton(int drawableRes, String description) {
         MaterialButton result = iconButton(drawableRes, description);
-        result.setIconSize(dp(18));
-        result.setMinWidth(dp(38));
-        result.setMinimumWidth(dp(38));
-        result.setMinHeight(dp(38));
-        result.setMinimumHeight(dp(38));
+        result.setIconSize(dp(20));
+        result.setMinWidth(dp(44));
+        result.setMinimumWidth(dp(44));
+        result.setMinHeight(dp(44));
+        result.setMinimumHeight(dp(44));
         return result;
     }
 
@@ -394,12 +398,6 @@ public final class PreviewActivity extends Activity {
             params.topMargin = Math.max(dp(8), overlaySafeInsets.top + dp(8));
             progressHost.setLayoutParams(params);
         }
-        if (tagToggle != null && tagToggle.getLayoutParams() instanceof FrameLayout.LayoutParams) {
-            FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) tagToggle.getLayoutParams();
-            params.rightMargin = Math.max(dp(16), overlaySafeInsets.right + dp(8));
-            params.bottomMargin = Math.max(dp(20), overlaySafeInsets.bottom + dp(12));
-            tagToggle.setLayoutParams(params);
-        }
         if (actionRow != null && actionRow.getLayoutParams() instanceof FrameLayout.LayoutParams) {
             FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) actionRow.getLayoutParams();
             params.rightMargin = Math.max(dp(16), overlaySafeInsets.right + dp(8));
@@ -415,8 +413,10 @@ public final class PreviewActivity extends Activity {
                 tagDragDownX = event.getRawX();
                 tagDragDownY = event.getRawY();
                 FrameLayout.LayoutParams start = tagPanelParams();
-                tagDragStartLeft = start.leftMargin;
-                tagDragStartTop = start.topMargin;
+                // Bottom/end gravity leaves leftMargin/topMargin at zero even after the panel
+                // has been laid out. Use the actual visible coordinates as the drag origin.
+                tagDragStartLeft = tagPanel.getLeft();
+                tagDragStartTop = tagPanel.getTop();
                 return true;
             case MotionEvent.ACTION_MOVE:
                 float dx = event.getRawX() - tagDragDownX;
@@ -436,7 +436,7 @@ public final class PreviewActivity extends Activity {
             case MotionEvent.ACTION_CANCEL:
                 if (draggingTagPanel) {
                     int panelCenter = tagPanel.getLeft() + tagPanel.getWidth() / 2;
-                    dockTagPanel(panelCenter >= overlayHost.getWidth() / 2);
+                    dockTagPanelSide(panelCenter >= overlayHost.getWidth() / 2);
                 }
                 draggingTagPanel = false;
                 return true;
@@ -473,6 +473,23 @@ public final class PreviewActivity extends Activity {
         clampTagPanelPosition();
     }
 
+    /** Snap only horizontally after a drag; keep the user's chosen vertical position. */
+    private void dockTagPanelSide(boolean right) {
+        if (tagPanel == null || overlayHost == null || tagPanel.getWidth() <= 0
+                || tagPanel.getHeight() <= 0) return;
+        tagPanelDockedRight = right;
+        tagPanelPositioned = true;
+        FrameLayout.LayoutParams params = tagPanelParams();
+        params.gravity = Gravity.TOP | Gravity.START;
+        params.leftMargin = right
+                ? overlayHost.getWidth() - overlaySafeInsets.right - tagPanel.getWidth() - dp(12)
+                : overlaySafeInsets.left + dp(12);
+        tagPanelLeft = params.leftMargin;
+        tagPanelTop = params.topMargin;
+        tagPanel.setLayoutParams(params);
+        clampTagPanelPosition();
+    }
+
     private void clampTagPanelPosition() {
         if (tagPanel == null || overlayHost == null || tagPanel.getWidth() <= 0
                 || tagPanel.getHeight() <= 0) return;
@@ -497,23 +514,34 @@ public final class PreviewActivity extends Activity {
         if (actionBusy || index < 0 || index >= items.size()) return;
         setActionBusy(true);
         downloadCurrentData((ok, message, data) -> {
-            setActionBusy(false);
             if (!ok) {
+                setActionBusy(false);
                 showError(entries.get(index), "下载失败: " + message);
                 return;
             }
-            pendingDownloadData = data;
-            pendingDownloadName = items.get(index).name;
-            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            intent.setType("application/octet-stream");
-            intent.putExtra(Intent.EXTRA_TITLE, pendingDownloadName);
+            String name = items.get(index).name;
             try {
-                startActivityForResult(intent, REQUEST_CREATE_DOCUMENT);
-            } catch (ActivityNotFoundException error) {
-                pendingDownloadData = null;
-                pendingDownloadName = null;
-                showError(entries.get(index), "系统没有可用的文件保存界面。");
+                imageExecutor.execute(() -> {
+                    String savedLocation = "";
+                    String error = "";
+                    try {
+                        savedLocation = com.openlistsorter.app.data.DownloadSaver.save(
+                                this, name, data);
+                    } catch (IOException | RuntimeException failure) {
+                        error = "保存失败: " + failure.getMessage();
+                    }
+                    String finalLocation = savedLocation;
+                    String finalError = error;
+                    mainHandler.post(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        setActionBusy(false);
+                        if (finalError.isEmpty()) titleView.setText("已保存到" + finalLocation + ": " + name);
+                        else showError(entries.get(index), finalError);
+                    });
+                });
+            } catch (RejectedExecutionException error) {
+                setActionBusy(false);
+                showError(entries.get(index), "后台保存任务已停止，请重试。");
             }
         });
     }
@@ -650,6 +678,9 @@ public final class PreviewActivity extends Activity {
         if (prevButton != null) prevButton.setEnabled(!busy && index > 0);
         if (nextButton != null) nextButton.setEnabled(!busy && index >= 0
                 && index < items.size() - 1);
+        if (actionPreviousButton != null) actionPreviousButton.setEnabled(!busy && index > 0);
+        if (actionNextButton != null) actionNextButton.setEnabled(!busy && index >= 0
+                && index < items.size() - 1);
     }
 
     private void updateActionState(Models.PreviewItem item) {
@@ -663,43 +694,6 @@ public final class PreviewActivity extends Activity {
         }
     }
 
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQUEST_CREATE_DOCUMENT) return;
-        byte[] bytes = pendingDownloadData;
-        String name = pendingDownloadName;
-        pendingDownloadData = null;
-        pendingDownloadName = null;
-        setActionBusy(false);
-        if (resultCode != RESULT_OK || data == null || data.getData() == null || bytes == null) {
-            return;
-        }
-        Uri target = data.getData();
-        try {
-            imageExecutor.execute(() -> {
-                String error = "";
-                try (OutputStream output = getContentResolver().openOutputStream(target, "w")) {
-                    if (output == null) error = "无法打开用户选择的保存位置。";
-                    else {
-                        output.write(bytes);
-                        output.flush();
-                    }
-                } catch (IOException | RuntimeException failure) {
-                    error = "下载保存失败: " + failure.getMessage();
-                }
-                String finalError = error;
-                mainHandler.post(() -> {
-                    if (isFinishing() || isDestroyed()) return;
-                    if (finalError.isEmpty()) titleView.setText("已下载: " + name);
-                    else showError(entries.get(index), finalError);
-                });
-            });
-        } catch (RejectedExecutionException error) {
-            showError(entries.get(index), "后台写入任务已停止，请重新下载。");
-        }
-    }
-
     private void render() {
         if (exiting || resourcesReleased) return;
         if (items.isEmpty()) {
@@ -707,6 +701,8 @@ public final class PreviewActivity extends Activity {
             counterView.setText("0 / 0");
             prevButton.setEnabled(false);
             nextButton.setEnabled(false);
+            if (actionPreviousButton != null) actionPreviousButton.setEnabled(false);
+            if (actionNextButton != null) actionNextButton.setEnabled(false);
             return;
         }
         if (items.get(index).removed) {
@@ -730,6 +726,8 @@ public final class PreviewActivity extends Activity {
         counterView.setText((index + 1) + " / " + items.size());
         prevButton.setEnabled(index > 0);
         nextButton.setEnabled(index < items.size() - 1);
+        if (actionPreviousButton != null) actionPreviousButton.setEnabled(index > 0 && !actionBusy);
+        if (actionNextButton != null) actionNextButton.setEnabled(index < items.size() - 1 && !actionBusy);
         imageView.setImageDrawable(null);
         imageView.setVisibility(View.GONE);
         releaseVideoPlayer();
@@ -742,6 +740,7 @@ public final class PreviewActivity extends Activity {
         } else {
             loadImage(index);
         }
+        prefetchNextImages();
     }
 
     private void renderTags(Models.PreviewItem item) {
@@ -762,7 +761,7 @@ public final class PreviewActivity extends Activity {
         updatingTagChecks = true;
         for (int i = 0; i < tagNames.size(); i++) {
             String name = tagNames.get(i);
-            MaterialCheckBox check = (MaterialCheckBox) tagGroup.getChildAt(i * 2);
+            MaterialCheckBox check = (MaterialCheckBox) tagGroup.getChildAt(i);
             check.setEnabled(item.tagsEditable);
             check.setChecked(item.selectedTags.contains(name));
         }
@@ -772,10 +771,10 @@ public final class PreviewActivity extends Activity {
     }
 
     private void ensureTagRows() {
-        boolean reusable = tagGroup.getChildCount() == tagNames.size() * 2;
+        boolean reusable = tagGroup.getChildCount() == tagNames.size();
         if (reusable) {
             for (int i = 0; i < tagNames.size(); i++) {
-                View row = tagGroup.getChildAt(i * 2);
+                View row = tagGroup.getChildAt(i);
                 if (!(row instanceof MaterialCheckBox)
                         || !tagNames.get(i).equals(row.getTag())) {
                     reusable = false;
@@ -790,10 +789,10 @@ public final class PreviewActivity extends Activity {
             check.setText(name);
             check.setTag(name);
             check.setTextColor(Color.WHITE);
-            check.setTextSize(14);
+            check.setTextSize(13);
             check.setGravity(Gravity.CENTER_VERTICAL);
-            check.setMinHeight(dp(48));
-            check.setPadding(dp(2), 0, dp(6), 0);
+            check.setMinHeight(dp(44));
+            check.setPadding(0, 0, dp(4), 0);
             check.setSingleLine(true);
             check.setEllipsize(android.text.TextUtils.TruncateAt.END);
             check.setOnCheckedChangeListener((button, checked) -> {
@@ -810,11 +809,77 @@ public final class PreviewActivity extends Activity {
                 }
                 persistSession();
             });
-            tagGroup.addView(check, new LinearLayout.LayoutParams(-1, dp(48)));
-            View divider = new View(this);
-            divider.setBackgroundColor(0x44ffffff);
-            tagGroup.addView(divider, new LinearLayout.LayoutParams(-1, 1));
+            GridLayout.LayoutParams params = new GridLayout.LayoutParams(
+                    GridLayout.spec(GridLayout.UNDEFINED, 1f),
+                    GridLayout.spec(GridLayout.UNDEFINED, 1f));
+            params.width = 0;
+            params.height = dp(44);
+            params.setMargins(dp(2), 0, dp(2), 0);
+            tagGroup.addView(check, params);
         }
+    }
+
+    /** Warm the shared raw cache for the next images without affecting the visible loading state. */
+    private void prefetchNextImages() {
+        if (exiting || resourcesReleased || items.isEmpty()) return;
+        int started = 0;
+        for (int target = index + 1; target < items.size()
+                && started < preloadConcurrency; target++) {
+            Models.PreviewItem item = items.get(target);
+            if (item.removed || item.isVideo) continue;
+            Models.RemoteEntry entry = entries.get(target);
+            String key = prefetchKey(entry);
+            if (prefetchInFlight.contains(key)
+                    || previewCache.hasRawData(entry)
+                    || previewCache.hasImage(entry)) {
+                continue;
+            }
+            prefetchInFlight.add(key);
+            started++;
+            prefetchItem(target, entry, key);
+        }
+    }
+
+    private void prefetchItem(int target, Models.RemoteEntry entry, String key) {
+        if (entry.rawUrl == null || entry.rawUrl.isEmpty()) {
+            client.getFileInfo(entry.path, (ok, message, fetched) -> {
+                if (!ok || fetched.rawUrl == null || fetched.rawUrl.isEmpty()) {
+                    prefetchInFlight.remove(key);
+                    return;
+                }
+                entry.rawUrl = fetched.rawUrl;
+                if (target >= 0 && target < items.size()) items.get(target).rawUrl = fetched.rawUrl;
+                prefetchDownload(entry, key);
+            });
+            return;
+        }
+        prefetchDownload(entry, key);
+    }
+
+    private void prefetchDownload(Models.RemoteEntry entry, String key) {
+        java.net.URL url = OpenListClient.resolveUrl(client.getBaseUrl(), entry.rawUrl);
+        if (url == null) {
+            prefetchInFlight.remove(key);
+            return;
+        }
+        client.downloadUrl(url, (ok, message, data) -> {
+            if (!ok || data == null || data.length == 0) {
+                prefetchInFlight.remove(key);
+                return;
+            }
+            try {
+                prefetchWriteExecutor.execute(() -> {
+                    previewCache.storeRawData(entry, data);
+                    mainHandler.post(() -> prefetchInFlight.remove(key));
+                });
+            } catch (RejectedExecutionException error) {
+                prefetchInFlight.remove(key);
+            }
+        }, null, true);
+    }
+
+    private static String prefetchKey(Models.RemoteEntry entry) {
+        return entry.path + "\n" + entry.size + "\n" + entry.modified;
     }
 
     private void loadImage(int target) {
@@ -950,12 +1015,15 @@ public final class PreviewActivity extends Activity {
     }
 
     private void showImage(Bitmap image) {
+        progressHost.setVisibility(View.GONE);
+        clearError();
         imageView.setImageBitmap(image);
         imageView.setVisibility(View.VISIBLE);
         imageView.resetView();
     }
 
     private void showError(Models.RemoteEntry entry, String message) {
+        progressHost.setVisibility(View.GONE);
         clearError();
         TextView error = new TextView(this);
         error.setText(entry.name + "\n\n" + message);
@@ -1160,6 +1228,9 @@ public final class PreviewActivity extends Activity {
             }
             imageExecutor.shutdown();
         }
+        if (prefetchWriteExecutor != null) {
+            prefetchWriteExecutor.shutdownNow();
+        }
         if (client != null) {
             client.shutdown();
             client = null;
@@ -1220,6 +1291,7 @@ public final class PreviewActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        mainHandler.removeCallbacks(hideTopBarRunnable);
         releaseImageResources();
         super.onDestroy();
     }
@@ -1254,6 +1326,36 @@ public final class PreviewActivity extends Activity {
         controller.hide(WindowInsetsCompat.Type.statusBars());
     }
 
+    private void showTopBarTemporarily() {
+        if (topBar == null) return;
+        mainHandler.removeCallbacks(hideTopBarRunnable);
+        if (topBar.getVisibility() != View.VISIBLE) {
+            topBar.setAlpha(0f);
+            topBar.setVisibility(View.VISIBLE);
+            topBar.animate().alpha(1f).setDuration(140L).start();
+        } else {
+            topBar.setAlpha(1f);
+        }
+        mainHandler.postDelayed(hideTopBarRunnable, TOP_BAR_HIDE_DELAY_MS);
+    }
+
+    private void toggleTopBar() {
+        if (topBar == null) return;
+        mainHandler.removeCallbacks(hideTopBarRunnable);
+        if (topBar.getVisibility() == View.VISIBLE && topBar.getAlpha() > 0f) {
+            hideTopBar();
+        } else {
+            showTopBarTemporarily();
+        }
+    }
+
+    private void hideTopBar() {
+        if (topBar == null || isFinishing() || isDestroyed()) return;
+        topBar.animate().alpha(0f).setDuration(180L).withEndAction(() -> {
+            if (topBar != null) topBar.setVisibility(View.GONE);
+        }).start();
+    }
+
     private void hideStatusBar() {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
         WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView())
@@ -1262,13 +1364,15 @@ public final class PreviewActivity extends Activity {
 
     private void applyTopBarInsets(View view) {
         final int baseHeight = dp(56);
-        final int topBreathingRoom = dp(12);
         ViewCompat.setOnApplyWindowInsetsListener(view, (target, windowInsets) -> {
             Insets safe = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout());
-            target.setPadding(safe.left, safe.top + topBreathingRoom, safe.right, 0);
+            // Status bars are hidden in this activity. Only reserve a real display cutout;
+            // treating a transient/status inset as padding creates a large blank band above the bar.
+            int topInset = safe.top;
+            target.setPadding(safe.left, topInset, safe.right, 0);
             ViewGroup.LayoutParams params = target.getLayoutParams();
             if (params != null) {
-                params.height = baseHeight + safe.top + topBreathingRoom;
+                params.height = baseHeight + topInset;
                 target.setLayoutParams(params);
             }
             return windowInsets;

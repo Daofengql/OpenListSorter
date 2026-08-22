@@ -1,6 +1,7 @@
 package com.openlistsorter.app.data;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.util.LruCache;
@@ -21,6 +22,10 @@ import static com.openlistsorter.app.data.Models.RemoteEntry;
 /** A bounded disk cache with a small decoded-image memory tier. */
 public final class PreviewCache {
     public static final long DEFAULT_MAX_DISK_BYTES = 256L * 1024L * 1024L;
+    public static final int MIN_DISK_MB = 64;
+    public static final int MAX_DISK_MB = 4096;
+    private static final String CACHE_PREFS = "cache";
+    private static final String MAX_DISK_MB_KEY = "maxDiskMb";
     // Keep the decoded tier small. A single 2048px ARGB bitmap is already about 16 MiB;
     // retaining several of them while an Activity is changing can otherwise trigger process
     // eviction on phones with a modest graphics heap.
@@ -49,8 +54,29 @@ public final class PreviewCache {
     private final LruCache<String, Bitmap> imageMemoryCache;
 
     public PreviewCache(Context context) {
-        this(new File(context.getCacheDir(), "previews"), DEFAULT_MAX_DISK_BYTES,
+        this(new File(context.getCacheDir(), "previews"), configuredMaxDiskBytes(context),
                 DEFAULT_MAX_MEMORY_BYTES);
+    }
+
+    public static int configuredMaxDiskMb(Context context) {
+        if (context == null) return (int) (DEFAULT_MAX_DISK_BYTES / (1024L * 1024L));
+        SharedPreferences prefs = context.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE);
+        return clampDiskMb(prefs.getInt(MAX_DISK_MB_KEY,
+                (int) (DEFAULT_MAX_DISK_BYTES / (1024L * 1024L))));
+    }
+
+    public static void configureMaxDiskMb(Context context, int megabytes) {
+        if (context == null) return;
+        context.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).edit()
+                .putInt(MAX_DISK_MB_KEY, clampDiskMb(megabytes)).apply();
+    }
+
+    private static long configuredMaxDiskBytes(Context context) {
+        return configuredMaxDiskMb(context) * 1024L * 1024L;
+    }
+
+    private static int clampDiskMb(int megabytes) {
+        return Math.max(MIN_DISK_MB, Math.min(MAX_DISK_MB, megabytes));
     }
 
     PreviewCache(File directory, long maxDiskBytes, int maxMemoryBytes) {
@@ -200,6 +226,10 @@ public final class PreviewCache {
         return directory.getAbsolutePath();
     }
 
+    public long maxDiskBytes() {
+        return maxDiskBytes;
+    }
+
     private Bitmap memoryGet(String key) {
         synchronized (memoryLock) {
             return imageMemoryCache.get(key);
@@ -280,7 +310,7 @@ public final class PreviewCache {
                 if (!temp.renameTo(file)) return false;
                 //noinspection ResultOfMethodCallIgnored
                 file.setLastModified(System.currentTimeMillis());
-                trimToSizeLocked();
+                trimToSizeLocked(file);
                 return file.isFile();
             }
         } catch (IOException error) {
@@ -305,6 +335,10 @@ public final class PreviewCache {
     }
 
     private void trimToSizeLocked() {
+        trimToSizeLocked(null);
+    }
+
+    private void trimToSizeLocked(File protectedFile) {
         File[] listed = directory.listFiles(file -> file.isFile() && !file.getName().contains(".tmp-"));
         if (listed == null) return;
         ArrayList<File> files = new ArrayList<>();
@@ -314,7 +348,11 @@ public final class PreviewCache {
             total += Math.max(0L, file.length());
         }
         if (total <= maxDiskBytes) return;
-        files.sort(Comparator.comparingLong(File::lastModified));
+        files.sort((left, right) -> {
+            if (protectedFile != null && left.equals(protectedFile)) return 1;
+            if (protectedFile != null && right.equals(protectedFile)) return -1;
+            return Comparator.comparingLong(File::lastModified).compare(left, right);
+        });
         for (File file : files) {
             long length = Math.max(0L, file.length());
             if (file.delete()) total -= length;

@@ -67,6 +67,17 @@ public final class PreviewCacheTest {
     }
 
     @Test
+    public void newestFileSurvivesWhenCacheIsFull() {
+        PreviewCache cache = new PreviewCache(directory, 64, 1024 * 1024);
+        Models.RemoteEntry first = entry("/old.jpg", 40, "1");
+        Models.RemoteEntry second = entry("/new.jpg", 40, "1");
+        assertTrue(cache.storeRawData(first, bytes(40, (byte) 1)));
+        assertTrue(cache.storeRawData(second, bytes(40, (byte) 2)));
+        assertNull(cache.loadRawData(first));
+        assertArrayEquals(bytes(40, (byte) 2), cache.loadRawData(second));
+    }
+
+    @Test
     public void concurrentWritesAreAtomicAndLeaveNoTemporaryFiles() throws Exception {
         PreviewCache cache = new PreviewCache(directory, 1024 * 1024, 1024 * 1024);
         Models.RemoteEntry entry = entry("/same.heic", 4096, "1");

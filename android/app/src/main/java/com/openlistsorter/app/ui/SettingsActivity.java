@@ -32,6 +32,9 @@ import com.openlistsorter.app.data.Models;
 import com.openlistsorter.app.data.PreviewCache;
 import com.openlistsorter.app.network.OpenListClient;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 /** iPad-style settings: category navigation on the left, detail content on the right. */
 public final class SettingsActivity extends Activity {
     public static final String EXTRA_LOGOUT = "settings_logout";
@@ -42,6 +45,7 @@ public final class SettingsActivity extends Activity {
     private TextView connectionStatus;
     private OpenListClient client;
     private ConnectionProfile profile;
+    private final ExecutorService cacheExecutor = Executors.newSingleThreadExecutor();
 
     @Override
     protected void onCreate(Bundle state) {
@@ -189,23 +193,58 @@ public final class SettingsActivity extends Activity {
     }
 
     private void showPerformance() {
-        resetDetail("性能与缓存", "调整预热和批量提交的并发数，查看缓存占用。全屏预览不再限制为 200 个文件。");
+        resetDetail("性能与缓存", "调整预热、提交并发和本地预览缓存。磁盘缓存满后会自动淘汰最久未使用的旧文件。");
         android.content.SharedPreferences prefs = getSharedPreferences("task", MODE_PRIVATE);
-        android.widget.NumberPicker preload = picker(1, 10, prefs.getInt("preloadConcurrency", 3));
-        android.widget.NumberPicker submit = picker(1, 4, prefs.getInt("submitConcurrency", 2));
+        ValueStepper preload = new ValueStepper(1, 10,
+                prefs.getInt("preloadConcurrency", 3), null, "分页预热并发数");
+        ValueStepper submit = new ValueStepper(1, 4,
+                prefs.getInt("submitConcurrency", 2), null, "批量提交并发数");
+        int[] cacheOptions = {256, 512, 1024, 2048, 4096};
+        String[] cacheLabels = {"256 MB", "512 MB", "1 GB", "2 GB", "4 GB"};
+        int selectedCache = 0;
+        int configuredMb = PreviewCache.configuredMaxDiskMb(this);
+        for (int i = 0; i < cacheOptions.length; i++) {
+            if (cacheOptions[i] == configuredMb) selectedCache = i;
+        }
+        ValueStepper cachePicker = new ValueStepper(0, cacheOptions.length - 1,
+                selectedCache, cacheLabels, "磁盘缓存上限");
+        cachePicker.setValue(selectedCache);
         detail.addView(settingRow("分页预热并发数", preload));
         detail.addView(settingRow("批量提交并发数", submit));
-        PreviewCache.Stats stats = new PreviewCache(this).stats();
+        detail.addView(settingRow("磁盘缓存上限", cachePicker));
+        PreviewCache previewCache = new PreviewCache(this);
+        PreviewCache.Stats stats = previewCache.stats();
         detail.addView(text("缓存 " + stats.fileCount + " 项 · " + Models.formatBytes(stats.totalBytes)
-                + " / " + Models.formatBytes(PreviewCache.DEFAULT_MAX_DISK_BYTES)
+                + " / " + Models.formatBytes(previewCache.maxDiskBytes())
                 + "\n原分辨率解码并发由设备内存自动决定", getColorCompat(R.color.on_surface_variant)));
         MaterialButton save = button("保存性能设置");
         save.setOnClickListener(v -> {
             prefs.edit().putInt("preloadConcurrency", preload.getValue())
                     .putInt("submitConcurrency", submit.getValue()).apply();
+            PreviewCache.configureMaxDiskMb(this, cacheOptions[cachePicker.getValue()]);
+            // Recreate the cache so reducing the limit trims old files immediately.
+            new PreviewCache(this);
             Toast.makeText(this, "性能设置已保存", Toast.LENGTH_SHORT).show();
         });
         detail.addView(save, new LinearLayout.LayoutParams(-1, dp(48)));
+        MaterialButton clear = button("清理预览缓存");
+        clear.setOnClickListener(v -> confirmClearPreviewCache());
+        detail.addView(clear, new LinearLayout.LayoutParams(-1, dp(48)));
+    }
+
+    private void confirmClearPreviewCache() {
+        PreviewCache cache = new PreviewCache(this);
+        PreviewCache.Stats stats = cache.stats();
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("清理预览缓存")
+                .setMessage("将删除 " + stats.fileCount + " 项缓存（"
+                        + Models.formatBytes(stats.totalBytes) + "）。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("清理", (dialog, which) -> cacheExecutor.execute(() -> {
+                    cache.clear();
+                    runOnUiThread(() -> Toast.makeText(this,
+                            "预览缓存已清理", Toast.LENGTH_SHORT).show());
+                })).show();
     }
 
     private void showAbout() {
@@ -240,20 +279,89 @@ public final class SettingsActivity extends Activity {
         detail.addView(logout, new LinearLayout.LayoutParams(-1, dp(48)));
     }
 
-    private android.widget.NumberPicker picker(int min, int max, int value) {
-        android.widget.NumberPicker picker = new android.widget.NumberPicker(this);
-        picker.setMinValue(min);
-        picker.setMaxValue(max);
-        picker.setValue(Math.max(min, Math.min(max, value)));
-        return picker;
-    }
-
     private LinearLayout settingRow(String label, View control) {
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.addView(text(label, getColorCompat(R.color.on_surface)), new LinearLayout.LayoutParams(0, -2, 1));
-        row.addView(control, new LinearLayout.LayoutParams(dp(104), dp(96)));
+        row.addView(control, new LinearLayout.LayoutParams(dp(148), dp(48)));
         return row;
+    }
+
+    /** Compact, accessible alternative to NumberPicker's tall selector wheel. */
+    private final class ValueStepper extends LinearLayout {
+        private final int min;
+        private final int max;
+        private final String[] labels;
+        private int value;
+        private final TextView valueView;
+
+        ValueStepper(int min, int max, int initial, String[] labels, String description) {
+            super(SettingsActivity.this);
+            this.min = min;
+            this.max = max;
+            this.labels = labels;
+            this.value = Math.max(min, Math.min(max, initial));
+            setOrientation(HORIZONTAL);
+            setGravity(Gravity.CENTER_VERTICAL);
+            setBackgroundColor(getColorCompat(R.color.surface_variant));
+            setContentDescription(description);
+
+            MaterialButton decrease = stepButton("−", "减少" + description);
+            decrease.setOnClickListener(v -> setValue(value - 1));
+            addView(decrease, new LinearLayout.LayoutParams(dp(40), dp(44)));
+
+            valueView = text(displayValue(), getColorCompat(R.color.on_surface));
+            valueView.setTextSize(14);
+            valueView.setGravity(Gravity.CENTER);
+            valueView.setSingleLine(true);
+            valueView.setContentDescription(description + "当前值");
+            addView(valueView, new LinearLayout.LayoutParams(0, dp(44), 1));
+
+            MaterialButton increase = stepButton("+", "增加" + description);
+            increase.setOnClickListener(v -> setValue(value + 1));
+            addView(increase, new LinearLayout.LayoutParams(dp(40), dp(44)));
+        }
+
+        int getValue() {
+            return value;
+        }
+
+        void setValue(int candidate) {
+            value = Math.max(min, Math.min(max, candidate));
+            if (valueView != null) valueView.setText(displayValue());
+        }
+
+        private String displayValue() {
+            if (labels != null && value >= 0 && value < labels.length) return labels[value];
+            return String.valueOf(value);
+        }
+    }
+
+    private MaterialButton stepButton(String label, String description) {
+        MaterialButton button = new MaterialButton(this);
+        button.setText(label);
+        // Keep the step controls high-contrast across Material 3/theme state lists.
+        // MaterialButton can otherwise inherit a low-emphasis on-surface variant
+        // color, which makes the +/- glyphs nearly disappear on the light surface.
+        button.setTextSize(22);
+        button.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        button.setTextColor(android.content.res.ColorStateList.valueOf(
+                getColorCompat(R.color.on_surface)));
+        button.setAllCaps(false);
+        button.setGravity(Gravity.CENTER);
+        button.setPadding(0, 0, 0, 0);
+        button.setContentDescription(description);
+        button.setInsetTop(0);
+        button.setInsetBottom(0);
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setCornerRadius(dp(4));
+        button.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
+                getColorCompat(R.color.surface)));
+        button.setStrokeWidth(dp(1));
+        button.setStrokeColor(android.content.res.ColorStateList.valueOf(
+                getColorCompat(R.color.outline)));
+        return button;
     }
 
     private TextInputLayout labelled(String label, View child) {
@@ -335,6 +443,7 @@ public final class SettingsActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        cacheExecutor.shutdownNow();
         if (client != null) client.shutdown();
         super.onDestroy();
     }
