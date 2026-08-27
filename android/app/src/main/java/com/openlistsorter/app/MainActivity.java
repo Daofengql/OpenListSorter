@@ -1943,7 +1943,7 @@ public final class MainActivity extends AppCompatActivity {
         }
         if (convertOnSave && Models.isImageFileName(item.entry.name)) {
             submitConverted(item, uniqueTargets, callback);
-        } else if (item.selectedTags.size() == 1) {
+        } else if (uniqueTargets.size() == 1) {
             client.moveFile(sourcePath, item.entry.name, selectedTargets.get(0), overwrite, callback);
         } else {
             copyTargets(item, uniqueTargets, 0, callback);
