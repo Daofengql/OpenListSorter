@@ -1,5 +1,7 @@
 # OpenList Sorter
 
+> Android 原生版位于本仓库 [`android/`](../android/README.md) 目录。
+
 OpenList Sorter 是一个 Qt5 桌面端远程文件分类工具，用连续预览、tag 暂存和批量提交来加速 OpenList/Alist 目录整理。
 
 启动时会先进入连接页。连接成功后才显示分类主窗口；主窗口顶部提供文件、编辑、帮助菜单。文件菜单里可以查看连接信息、打开设置或注销；注销会关闭自动登录、断开当前会话并关闭主窗口，不会清掉已保存的 endpoint/key。底部状态栏会显示当前 endpoint，并在连接后补充延迟、IP 和远端版本。

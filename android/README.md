@@ -1,6 +1,6 @@
 # OpenList Sorter Android
 
-这是同级 Qt5 项目 `/data/projects/OpenListSorter` 的原生 Android 版本，使用 Java、Android View、Material Components 和 OkHttp。文件操作语义、分页、tag 暂存、WebP 提交规则与 Qt 版保持一致；触屏布局、系统文件保存和生命周期处理按 Android 平台调整。
+这是 OpenListSorter 的 Android 原生版本，使用 Java、Android View、Material Components 和 OkHttp。Qt5 桌面版位于本仓库 [`qt/`](../qt/README.md) 目录。文件操作语义、分页、tag 暂存、WebP 提交规则与 Qt 版保持一致；触屏布局、系统文件保存和生命周期处理按 Android 平台调整。
 
 ## 功能
 
